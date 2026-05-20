@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(New-Item -ItemType Directory -Force -Path \"d:\\\\xampp\\\\apache\\\\bin\\\\visorshield\\\\alembic\\\\versions\")",
+      "Bash(Get-ChildItem -Path \"d:\\\\xampp\\\\apache\\\\bin\\\\visorshield\" -Recurse -Include *.py, Dockerfile, docker-compose.yml, requirements.txt, alembic.ini, pytest.ini, .env.example)",
+      "Bash(Select-Object FullName)"
+    ]
+  }
+}
