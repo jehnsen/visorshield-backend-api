@@ -1,6 +1,5 @@
 import uuid
-from datetime import datetime
-from sqlalchemy import Column, String, UniqueConstraint, TIMESTAMP, ForeignKey
+from sqlalchemy import Column, String, UniqueConstraint, TIMESTAMP, ForeignKey, func
 from sqlalchemy.dialects.postgresql import UUID
 from pgvector.sqlalchemy import Vector
 from app.db.database import Base
@@ -17,8 +16,10 @@ class PolicyEmbedding(Base):
     policy_profile = Column(String(50), nullable=False)
     topic = Column(String(255), nullable=False)
     embedding = Column(Vector(VECTOR_DIMS), nullable=False)
-    created_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
-    updated_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(
+        TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
 
     __table_args__ = (
         UniqueConstraint("org_id", "policy_profile", "topic", name="uq_org_policy_topic"),

@@ -5,14 +5,11 @@ import structlog
 from typing import List, Dict, Tuple
 from fastapi import Request, HTTPException
 from presidio_analyzer import AnalyzerEngine, RecognizerRegistry, PatternRecognizer, Pattern
-from presidio_anonymizer import AnonymizerEngine
-from presidio_anonymizer.entities import OperatorConfig
 from app.policies import get_policy
 
 log = structlog.get_logger()
 
 _analyzer: AnalyzerEngine | None = None
-_anonymizer: AnonymizerEngine | None = None
 
 
 def _build_ph_recognizers() -> List[PatternRecognizer]:
@@ -46,47 +43,78 @@ def get_analyzer() -> AnalyzerEngine:
     return _analyzer
 
 
-def get_anonymizer() -> AnonymizerEngine:
-    global _anonymizer
-    if _anonymizer is None:
-        _anonymizer = AnonymizerEngine()
-    return _anonymizer
-
-
 def _scan_text(text: str, entities: List[str], language: str = "en") -> Tuple[str, List[str], Dict]:
     """
-    Analyzes and anonymizes text. Returns (anonymized_text, entity_type_list, placeholder_map).
-    entity_type_list contains only entity types (not values) for audit logging.
+    Analyzes and redacts text. Returns (masked_text, entity_type_list, placeholder_map).
+
+    Every detected span gets its own index-aware placeholder (``[PERSON_1]``,
+    ``[PERSON_2]``, …) so distinct entities of the same type stay distinguishable
+    and ``placeholder_map`` is an accurate, complete reverse mapping for
+    rehydration. entity_type_list contains only entity types (not values).
     """
     analyzer = get_analyzer()
-    anonymizer = get_anonymizer()
 
     results = analyzer.analyze(text=text, entities=entities, language=language)
     if not results:
         return text, [], {}
 
-    entity_counts: Dict[str, int] = {}
-    operators: Dict[str, OperatorConfig] = {}
+    # Greedy non-overlapping selection: earliest start first, higher score wins
+    # ties. Presidio can return overlapping spans; replacing them all would
+    # corrupt offsets.
+    ordered = sorted(results, key=lambda r: (r.start, -r.score, -(r.end - r.start)))
+    selected = []
+    last_end = -1
+    for r in ordered:
+        if r.start >= last_end:
+            selected.append(r)
+            last_end = r.end
 
-    for result in results:
-        etype = result.entity_type
+    entity_counts: Dict[str, int] = {}
+    placeholder_map: Dict[str, str] = {}
+    spans: List[Tuple[int, int, str]] = []
+    for r in sorted(selected, key=lambda r: r.start):
+        etype = r.entity_type
         entity_counts[etype] = entity_counts.get(etype, 0) + 1
         placeholder = f"[{etype}_{entity_counts[etype]}]"
-        operators[etype] = OperatorConfig("replace", {"new_value": placeholder})
+        placeholder_map[placeholder] = text[r.start:r.end]
+        spans.append((r.start, r.end, placeholder))
 
-    anonymized = anonymizer.anonymize(text=text, analyzer_results=results, operators=operators)
-    detected_types = list({r.entity_type for r in results})
+    # Apply replacements right-to-left so earlier offsets remain valid.
+    masked = text
+    for start, end, placeholder in sorted(spans, key=lambda s: s[0], reverse=True):
+        masked = masked[:start] + placeholder + masked[end:]
 
-    # Build a reverse mapping for potential de-anonymization (not persisted to DB)
-    placeholder_map = {}
-    for result in sorted(results, key=lambda r: r.start):
-        etype = result.entity_type
-        original_value = text[result.start:result.end]
-        n = entity_counts.get(etype, 1)
-        placeholder = f"[{etype}_{n}]"
-        placeholder_map[placeholder] = original_value
+    detected_types = list({r.entity_type for r in selected})
+    return masked, detected_types, placeholder_map
 
-    return anonymized.text, detected_types, placeholder_map
+
+def rehydrate_pii(text: str, placeholder_map: Dict[str, str]) -> Tuple[str, int]:
+    """
+    Restore caller-supplied PII values in an outbound LLM response.
+
+    The prompt is masked before it reaches the model ("Juan dela Cruz" -> ``[PERSON_1]``);
+    the model then echoes those placeholders back in its answer. This swaps them
+    for the original values so the client gets a natural response instead of
+    tokens — the single biggest UX differentiator vs. a plain proxy.
+
+    Only values the caller themselves supplied (i.e. present in the request-scoped
+    ``placeholder_map``) are restored. PII the model newly introduced is handled
+    by the response scanner, which must run BEFORE this. ``placeholder_map`` is
+    request-scoped and is never persisted or logged.
+
+    Returns (rehydrated_text, number_of_substitutions).
+    """
+    if not text or not placeholder_map:
+        return text, 0
+
+    count = 0
+    # Longest placeholders first so "[PERSON_1]" doesn't partially match "[PERSON_11]".
+    for placeholder in sorted(placeholder_map, key=len, reverse=True):
+        occurrences = text.count(placeholder)
+        if occurrences:
+            text = text.replace(placeholder, placeholder_map[placeholder])
+            count += occurrences
+    return text, count
 
 
 def _apply_regex_patterns(text: str, patterns: Dict[str, str]) -> str:

@@ -30,6 +30,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /install /usr/local
 COPY app/ ./app/
+# Needed by the `migrate` compose service: `alembic upgrade head`
+COPY alembic/ ./alembic/
+COPY alembic.ini ./
 
 RUN chown -R visorshield:visorshield /app
 USER visorshield

@@ -87,6 +87,9 @@ async def auth_middleware(request: Request) -> dict:
     role = payload.get("role", "user")
     rpm_limit = int(payload.get("rpm_limit", 60))
     monthly_token_budget = int(payload.get("monthly_token_budget", 1_000_000))
+    # Opt-in only: when false (default) SSE responses are buffered and PII-scanned
+    # before any byte reaches the client. See app/routers/proxy.py::_stream_response.
+    allow_streaming_passthrough = bool(payload.get("allow_streaming_passthrough", False))
 
     if not org_id:
         raise HTTPException(status_code=401, detail={"error": "missing_org_id_in_token"})
@@ -119,6 +122,7 @@ async def auth_middleware(request: Request) -> dict:
         "role": role,
         "rpm_limit": rpm_limit,
         "monthly_token_budget": monthly_token_budget,
+        "allow_streaming_passthrough": allow_streaming_passthrough,
         "sub": sub,
     }
 

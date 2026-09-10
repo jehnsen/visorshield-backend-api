@@ -15,9 +15,13 @@ CHEAP_TOKEN_THRESHOLD = 500
 CHEAP_COMPLEXITY_THRESHOLD = 0.4
 
 COMPLEXITY_KEYWORDS = [
-    "analyze", "synthesize", "reason", "compare", "evaluate", "explain in detail",
-    "step by step", "comprehensive", "elaborate", "critique", "pros and cons",
-    "write a report", "research", "summarize multiple", "translate",
+    # Spec keywords (CLAUDE.md "LLM Cost Routing Rules") — presence of any one of
+    # these is enough to keep a request off the cheap model.
+    "analyze", "compare", "summarize", "generate", "explain in detail",
+    # Additional high-effort signals
+    "synthesize", "reason", "evaluate", "step by step", "comprehensive",
+    "elaborate", "critique", "pros and cons", "write a report", "research",
+    "translate",
 ]
 
 CHEAP_MODEL_MAP = {
@@ -60,7 +64,10 @@ def compute_complexity_score(messages: list) -> float:
                     text += part.get("text", "").lower()
 
     hits = sum(1 for kw in COMPLEXITY_KEYWORDS if kw in text)
-    return min(1.0, hits / max(len(COMPLEXITY_KEYWORDS), 1) * 3)
+    # Each matched keyword contributes 0.4, so a single strong keyword
+    # (e.g. "analyze this contract") reaches CHEAP_COMPLEXITY_THRESHOLD and the
+    # request is kept on the full model.
+    return min(1.0, hits * CHEAP_COMPLEXITY_THRESHOLD)
 
 
 def should_use_cheap_model(messages: list) -> Tuple[bool, str]:

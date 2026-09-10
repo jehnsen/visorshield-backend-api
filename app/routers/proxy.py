@@ -9,20 +9,45 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from app.models.request import ChatCompletionRequest
 from app.middleware.auth import auth_middleware
 from app.middleware.rate_limit import rate_limit_middleware, increment_token_usage
-from app.middleware.pii_engine import pii_scan_request
+from app.middleware.pii_engine import pii_scan_request, rehydrate_pii
 from app.middleware.guardrails import guardrails_middleware
 from app.middleware.response_scanner import scan_response
 from app.services.llm_router import route_request, stream_request
 from app.services.audit_service import log_transaction, log_guardrail_incident, fire_and_forget_audit
 from app.services.cost_calculator import calculate_cost
+from app.policies import VALID_INDUSTRY_TYPES
+from app.config import settings
 
 log = structlog.get_logger()
 router = APIRouter()
 
 
+def _require_valid_industry_type(request: Request) -> str:
+    """
+    Enforce a recognized X-Industry-Type header before any pipeline step runs.
+
+    Fail-closed: an unknown or missing profile would cause PII masking to fall
+    back to a generic entity list and would skip the guardrail check entirely,
+    so the request is rejected outright — consistent with the PII fail-closed rule.
+    """
+    industry_type = request.headers.get("X-Industry-Type", "").strip()
+    if industry_type not in VALID_INDUSTRY_TYPES:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "invalid_industry_type",
+                "message": "X-Industry-Type header is required and must be one of: "
+                + ", ".join(sorted(VALID_INDUSTRY_TYPES)),
+                "allowed": sorted(VALID_INDUSTRY_TYPES),
+            },
+        )
+    return industry_type
+
+
 async def _run_pipeline(request: Request, body: ChatCompletionRequest) -> None:
     """Execute the 4-step pre-LLM interceptor pipeline in order."""
     request.state.parsed_body = body
+    _require_valid_industry_type(request)
     await auth_middleware(request)
     await rate_limit_middleware(request)
     await pii_scan_request(request)
@@ -117,21 +142,37 @@ async def chat_completions(request: Request):
     input_tokens = usage.get("prompt_tokens", 0)
     output_tokens = usage.get("completion_tokens", 0)
 
-    response_text = ""
+    # Step 5: Response scanner — scan each choice independently. Concatenating all
+    # choices into one blob (n > 1) and writing it back to every choice both
+    # corrupts multi-choice responses and cross-contaminates them.
+    #
+    # Order per choice: scan (mask model-introduced PII) → rehydrate (restore the
+    # caller's own PII that we masked out of the prompt). Rehydration must come
+    # after the scan so restored values aren't re-flagged/re-masked.
+    ph_map = getattr(request.state, "pii_placeholder_map", {})
+    all_response_pii: list = []
+    rehydrated_total = 0
     for choice in result.get("choices", []):
         msg = choice.get("message", {})
         content = msg.get("content", "")
-        if content:
-            response_text += content
+        if not content:
+            continue
+        scanned = await scan_response(content, request)
+        all_response_pii.extend(getattr(request.state, "response_pii_detected", []))
+        if settings.PII_REHYDRATION_ENABLED:
+            scanned, n = rehydrate_pii(scanned, ph_map)
+            rehydrated_total += n
+        msg["content"] = scanned
 
-    # Step 5: Response scanner
-    masked_response = await scan_response(response_text, request)
-
-    # Patch response with masked content
-    for choice in result.get("choices", []):
-        msg = choice.get("message", {})
-        if msg.get("content"):
-            msg["content"] = masked_response
+    request.state.response_pii_detected = sorted(set(all_response_pii))
+    if rehydrated_total:
+        log.info(
+            "pii_rehydrated",
+            org_id=org_id,
+            request_id=request.state.request_id,
+            pipeline_step="response_scanner",
+            substitutions=rehydrated_total,
+        )
 
     cost_usd = calculate_cost(model_used, input_tokens, output_tokens)
 
@@ -162,6 +203,12 @@ async def chat_completions(request: Request):
 
     response = JSONResponse(content=result)
     response.headers["X-VisorShield-Request-ID"] = request.state.request_id
+    pii_masked = bool(
+        getattr(request.state, "pii_detected", [])
+        or getattr(request.state, "response_pii_detected", [])
+    )
+    response.headers["X-VisorShield-PII-Masked"] = "true" if pii_masked else "false"
+    response.headers["X-VisorShield-Model-Used"] = model_used
     return response
 
 
@@ -171,26 +218,33 @@ async def _stream_response(
     model_requested: str,
 ) -> AsyncGenerator[str, None]:
     """
-    Pipe SSE chunks (already in OpenAI format from stream_request) while buffering
-    the full response text for post-stream PII scanning and audit logging.
+    Stream an SSE response with step-5 PII scanning enforced on the client path.
+
+    Default (compliance) mode: the full upstream response is buffered, run through
+    scan_response(), and only the *masked* text is emitted to the client. Nothing
+    reaches the caller until PII scanning has passed — no raw LLM output is ever
+    streamed.
+
+    Pass-through mode (JWT claim ``allow_streaming_passthrough: true``, an explicit
+    per-org opt-in): raw chunks are streamed live for low TTFB. The scan still runs
+    afterwards, and if it changed anything a trailing correction frame carrying the
+    masked text is appended so raw PII is never left uncorrected.
     """
     from app.services.llm_router import _detect_provider
     claims = request.state.jwt_claims
     org_id = claims.get("org_id", "unknown")
     pipeline_start = request.state._pipeline_start
+    passthrough = bool(claims.get("allow_streaming_passthrough", False))
     buffered_content = []
     input_tokens = 0
     output_tokens = 0
     model_used = body.model
     provider = _detect_provider(body.model)
-    routing_reason = "stream"
+    routing_reason = "stream" if passthrough else "stream_buffered"
 
     try:
         async for line in stream_request(body, request):
-            # stream_request yields bare lines; emit as proper SSE frames
             stripped = line.rstrip("\n")
-            if stripped:
-                yield f"{stripped}\n\n" if not stripped.endswith("\n") else f"{stripped}\n"
             # Parse OpenAI-format chunks to buffer content + usage
             if stripped.startswith("data: ") and stripped != "data: [DONE]":
                 try:
@@ -208,15 +262,62 @@ async def _stream_response(
                     provider = _detect_provider(model_used)
                 except Exception:
                     pass
+            # Only forward raw chunks live when the org opted into pass-through.
+            if passthrough and stripped:
+                yield f"{stripped}\n\n" if not stripped.endswith("\n") else f"{stripped}\n"
     except Exception as exc:
         log.error("stream_failed", error=str(exc), org_id=org_id, request_id=request.state.request_id)
         yield "data: [DONE]\n\n"
         return
 
-    # Post-stream response scan (step 5)
+    # Step 5: response scan — enforced on the streaming path, not audit-only.
     full_response = "".join(buffered_content)
-    if full_response:
-        await scan_response(full_response, request)
+    masked_response = await scan_response(full_response, request) if full_response else ""
+
+    # Rehydrate the caller's own PII (masked out of the prompt) in the buffered
+    # path. Pass-through mode already streamed raw chunks with placeholders in
+    # them — that is the documented cost of the opt-in.
+    if full_response and not passthrough and settings.PII_REHYDRATION_ENABLED:
+        ph_map = getattr(request.state, "pii_placeholder_map", {})
+        masked_response, n = rehydrate_pii(masked_response, ph_map)
+        if n:
+            log.info(
+                "pii_rehydrated",
+                org_id=org_id,
+                request_id=getattr(request.state, "request_id", ""),
+                pipeline_step="response_scanner",
+                substitutions=n,
+            )
+
+    def _sse_chunk(text: str) -> str:
+        payload = {
+            "id": f"chatcmpl-{getattr(request.state, 'request_id', '')}",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model_used,
+            "choices": [
+                {"index": 0, "delta": {"role": "assistant", "content": text}, "finish_reason": "stop"}
+            ],
+        }
+        return f"data: {json.dumps(payload)}\n\n"
+
+    if not passthrough:
+        # Client has received nothing yet — emit the scanned/masked response now.
+        if full_response:
+            yield _sse_chunk(masked_response)
+    elif masked_response != full_response:
+        # Raw chunks already went out and the scan changed something. Per the
+        # fail-closed PII policy, follow up with the masked full text.
+        log.warning(
+            "stream_passthrough_pii_masked",
+            org_id=org_id,
+            request_id=getattr(request.state, "request_id", ""),
+            pipeline_step="response_scanner",
+        )
+        yield _sse_chunk(
+            "\n\n[VisorShield: PII was detected in the streamed response above. "
+            "Masked version follows]\n" + masked_response
+        )
 
     latency_ms = int((time.monotonic() - pipeline_start) * 1000)
     cost_usd = calculate_cost(model_used, input_tokens, output_tokens)

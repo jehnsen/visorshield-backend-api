@@ -12,6 +12,10 @@ POLICY_REGISTRY = {
     "legal_hr": LEGAL_HR_POLICY,
 }
 
+# The set of accepted X-Industry-Type header values. An unrecognized value must
+# be rejected up front, never silently downgraded to a generic profile.
+VALID_INDUSTRY_TYPES = frozenset(POLICY_REGISTRY.keys())
+
 
 def get_policy(industry_type: str) -> Optional[PolicyProfile]:
     return POLICY_REGISTRY.get(industry_type)

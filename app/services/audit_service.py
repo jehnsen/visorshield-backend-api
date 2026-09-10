@@ -106,6 +106,34 @@ async def log_guardrail_incident(
     )
 
 
+# Strong references to in-flight audit tasks. Without this the event loop only
+# keeps a weak reference and may garbage-collect a task mid-write.
+_background_tasks: set = set()
+
+
+def _on_audit_task_done(task: "asyncio.Task") -> None:
+    _background_tasks.discard(task)
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        log.error("audit_task_failed", error=str(exc), error_type=type(exc).__name__)
+
+
 def fire_and_forget_audit(coro) -> None:
-    """Schedule audit logging as a background task (non-blocking)."""
-    asyncio.create_task(coro)
+    """Schedule audit logging as a background task (non-blocking).
+
+    Holds a strong reference until completion so the task can't be GC'd
+    mid-flight, and drains the task's exception via a done callback so a failed
+    write is logged instead of surfacing as "Task exception was never retrieved".
+    """
+    try:
+        task = asyncio.create_task(coro)
+    except RuntimeError:
+        # No running event loop (e.g. called from a sync context). Close the
+        # coroutine to avoid an "never awaited" warning and log the drop.
+        coro.close()
+        log.warning("audit_task_no_event_loop")
+        return
+    _background_tasks.add(task)
+    task.add_done_callback(_on_audit_task_done)

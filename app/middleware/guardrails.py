@@ -6,7 +6,7 @@ import numpy as np
 from typing import List, Optional, Tuple, Dict
 from fastapi import Request, HTTPException
 from sentence_transformers import SentenceTransformer
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, text
 from app.policies import get_policy
 from app.config import settings
 
@@ -14,8 +14,11 @@ log = structlog.get_logger()
 
 _embedding_model: SentenceTransformer | None = None
 
-# In-memory cache: key = (org_id, policy_name), value = (embeddings_array, topics_list, expiry_ts)
-_db_embedding_cache: Dict[str, Tuple[np.ndarray, List[str], float]] = {}
+# Presence cache: key = "{org_id}:{policy_name}", value = (has_db_topics: bool, expiry_ts).
+# We only cache *whether* an org has custom pgvector topics — the nearest-topic
+# search itself runs in Postgres against the ivfflat index so it stays correct
+# at thousands of topics.
+_db_presence_cache: Dict[str, Tuple[bool, float]] = {}
 
 # Default policy embeddings (in-process, computed once at warm-up)
 _default_embeddings_cache: Dict[str, np.ndarray] = {}
@@ -43,67 +46,95 @@ def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-10))
 
 
-async def _load_db_embeddings(
-    org_id: str, policy_name: str
-) -> Optional[Tuple[np.ndarray, List[str]]]:
+async def _org_has_db_embeddings(org_id: str, policy_name: str) -> bool:
     """
-    Load org-specific policy embeddings from pgvector.
-    Returns (embeddings_matrix, topics) or None if no DB entries exist.
-    Uses a TTL cache to avoid a DB round-trip on every request.
+    Whether this org has any custom pgvector guardrail topics for this policy.
+
+    TTL-cached so the common case (no custom topics) costs one cheap EXISTS
+    query every EMBEDDING_CACHE_TTL_SECONDS rather than a round-trip per request.
+    On any DB error we return False and the caller falls back to the in-process
+    default topics.
     """
     cache_key = f"{org_id}:{policy_name}"
     now = time.monotonic()
 
-    cached = _db_embedding_cache.get(cache_key)
-    if cached is not None:
-        embs, topics, expiry = cached
-        if now < expiry:
-            return (embs, topics) if len(topics) > 0 else None
-        del _db_embedding_cache[cache_key]
+    cached = _db_presence_cache.get(cache_key)
+    if cached is not None and now < cached[1]:
+        return cached[0]
 
+    has_rows = False
     try:
         from app.db.database import AsyncSessionLocal
-        from app.models.embeddings import PolicyEmbedding
         import uuid as _uuid
 
         async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(PolicyEmbedding.topic, PolicyEmbedding.embedding).where(
-                    and_(
-                        PolicyEmbedding.org_id == _uuid.UUID(org_id),
-                        PolicyEmbedding.policy_profile == policy_name,
-                    )
+            found = await session.execute(
+                text(
+                    "SELECT 1 FROM policy_embeddings "
+                    "WHERE org_id = :org_id AND policy_profile = :policy LIMIT 1"
+                ),
+                {"org_id": str(_uuid.UUID(org_id)), "policy": policy_name},
+            )
+            has_rows = found.first() is not None
+    except Exception as exc:
+        log.warning("db_embedding_presence_failed", error=str(exc), org_id=org_id, policy=policy_name)
+        return False
+
+    _db_presence_cache[cache_key] = (has_rows, now + settings.EMBEDDING_CACHE_TTL_SECONDS)
+    return has_rows
+
+
+async def _query_nearest_topic_db(
+    org_id: str, policy_name: str, prompt_embedding: np.ndarray
+) -> Optional[Tuple[str, float]]:
+    """
+    Nearest prohibited topic for this prompt, computed in Postgres against the
+    ivfflat cosine index (idx_policy_embeddings_ivfflat). Returns (topic,
+    cosine_similarity) for the closest row, or None on error / no rows.
+
+    Using `ORDER BY embedding <=> :vec LIMIT 1` is what lets the planner use the
+    ANN index; pulling every row into NumPy (the old approach) does not scale.
+    """
+    vec = np.asarray(prompt_embedding, dtype=np.float32).ravel()
+    vec_literal = "[" + ",".join(f"{float(x):.8f}" for x in vec) + "]"
+
+    try:
+        from app.db.database import AsyncSessionLocal
+        import uuid as _uuid
+
+        probes = max(1, int(settings.IVFFLAT_PROBES))
+
+        async with AsyncSessionLocal() as session:
+            # Session-local knob: probe more lists for better recall. Inlined
+            # (not bound) because Postgres SET does not take bind parameters;
+            # the value is a coerced int from config, never user input.
+            await session.execute(text(f"SET LOCAL ivfflat.probes = {probes}"))
+            row = (
+                await session.execute(
+                    text(
+                        "SELECT topic, 1 - (embedding <=> CAST(:vec AS vector)) AS similarity "
+                        "FROM policy_embeddings "
+                        "WHERE org_id = :org_id AND policy_profile = :policy "
+                        "ORDER BY embedding <=> CAST(:vec AS vector) "
+                        "LIMIT 1"
+                    ),
+                    {"vec": vec_literal, "org_id": str(_uuid.UUID(org_id)), "policy": policy_name},
                 )
-            )
-            rows = result.all()
+            ).first()
 
-        if not rows:
-            # Cache the "no entries" result to avoid hammering DB
-            _db_embedding_cache[cache_key] = (
-                np.array([]),
-                [],
-                now + settings.EMBEDDING_CACHE_TTL_SECONDS,
-            )
+        if row is None:
             return None
-
-        topics = [r.topic for r in rows]
-        embs = np.array([r.embedding for r in rows], dtype=np.float32)
-        # Normalise in case stored vectors aren't unit-length
-        norms = np.linalg.norm(embs, axis=1, keepdims=True)
-        embs = embs / (norms + 1e-10)
-
-        _db_embedding_cache[cache_key] = (embs, topics, now + settings.EMBEDDING_CACHE_TTL_SECONDS)
-        return (embs, topics)
+        return row.topic, float(row.similarity)
 
     except Exception as exc:
-        log.warning("db_embedding_load_failed", error=str(exc), org_id=org_id, policy=policy_name)
+        log.warning("db_embedding_query_failed", error=str(exc), org_id=org_id, policy=policy_name)
         return None
 
 
 def invalidate_embedding_cache(org_id: str, policy_name: str) -> None:
-    """Call this after upserting policy embeddings via the admin API."""
+    """Call this after upserting/deleting policy embeddings via the admin API."""
     cache_key = f"{org_id}:{policy_name}"
-    _db_embedding_cache.pop(cache_key, None)
+    _db_presence_cache.pop(cache_key, None)
 
 
 def _check_keyword_blocklist(text: str, blocklist: List[str]) -> Optional[str]:
@@ -111,6 +142,47 @@ def _check_keyword_blocklist(text: str, blocklist: List[str]) -> Optional[str]:
     for keyword in blocklist:
         if keyword.lower() in text_lower:
             return keyword
+    return None
+
+
+# ── Prompt-injection heuristics ──────────────────────────────────────────────
+# Curated patterns for the "ignore previous instructions" family. Topic policy
+# (keyword + embedding) does not cover instruction-override attacks, and an
+# explicit prompt-injection control is a line item on healthcare / govtech RFPs.
+# Deliberately conservative to keep false positives low on legitimate prompts.
+_PROMPT_INJECTION_PATTERNS: List[Tuple[str, "re.Pattern[str]"]] = [
+    ("ignore_previous_instructions", re.compile(
+        r"\b(?:ignore|disregard|forget|discard|skip)\b[^.\n]{0,40}?"
+        r"\b(?:all\s+|any\s+|the\s+|your\s+|previous\s+|prior\s+|earlier\s+|above\s+|preceding\s+|foregoing\s+)*"
+        r"(?:instruction|prompt|direction|rule|guideline|context|message)s?\b", re.I)),
+    ("override_system_prompt", re.compile(
+        r"\b(?:override|bypass|circumvent|ignore|disable|turn\s+off|switch\s+off)\b[^.\n]{0,30}?"
+        r"\b(?:system\s+prompt|system\s+message|safety|guardrail|content\s+filter|restriction|moderation|policy|policies)\b", re.I)),
+    ("reveal_system_prompt", re.compile(
+        r"\b(?:reveal|show|share|print|repeat|output|display|reprint|give\s+me|tell\s+me)\b[^.\n]{0,30}?"
+        r"\b(?:your\s+)?(?:system\s+prompt|system\s+message|initial\s+instruction|original\s+instruction|"
+        r"hidden\s+prompt|the\s+prompt\s+above|these\s+instructions)\b", re.I)),
+    ("new_instructions_marker", re.compile(
+        r"\b(?:new|updated|revised|real|actual|true)\s+(?:instruction|prompt|rule|task)s?\s*[:\-]", re.I)),
+    ("role_override", re.compile(
+        r"\byou\s+are\s+now\s+(?:a|an|the|no\s+longer|not)\b|"
+        r"\bfrom\s+now\s+on[,]?\s+you\b|"
+        r"\b(?:act|behave|respond|roleplay)\s+as\s+(?:if\s+you\s+are\s+)?(?:a\s+|an\s+)?"
+        r"(?:unrestricted|unfiltered|uncensored|jailbroken|different)\b", re.I)),
+    ("known_jailbreak_token", re.compile(
+        r"\b(?:DAN|STAN|DUDE)\b|\bdeveloper\s+mode\b|\bdo\s+anything\s+now\b|\bjailbreak\b", re.I)),
+    ("prompt_delimiter_injection", re.compile(
+        r"</?(?:system|assistant|user|instructions?|prompt)\s*>|"
+        r"\[/?(?:system|inst|instructions?|prompt)\]|"
+        r"^\s*#{0,3}\s*system\s*:", re.I | re.M)),
+]
+
+
+def _check_prompt_injection(text: str) -> Optional[str]:
+    """Return the name of the first matching prompt-injection pattern, or None."""
+    for name, pattern in _PROMPT_INJECTION_PATTERNS:
+        if pattern.search(text):
+            return name
     return None
 
 
@@ -144,10 +216,12 @@ def _extract_prompt_text(body) -> str:
 
 async def guardrails_middleware(request: Request) -> None:
     """
-    Step 4: Two-layer compliance guardrail check.
+    Step 4: Multi-layer compliance guardrail check.
     Layer 1 — keyword/regex blocklist (fast, synchronous).
-    Layer 2 — embedding similarity. Uses pgvector per-org embeddings when available,
-               falls back to default in-process embeddings.
+    Layer 2 — prompt-injection heuristics ("ignore previous instructions" family).
+    Layer 3 — embedding similarity. Per-org pgvector topics are searched in
+              Postgres against the ivfflat index; otherwise the default
+              in-process topic embeddings are used.
     Returns HTTP 451 on violation.
     """
     start = time.monotonic()
@@ -158,8 +232,21 @@ async def guardrails_middleware(request: Request) -> None:
     org_id = getattr(request.state, "jwt_claims", {}).get("org_id", "unknown")
 
     if not policy:
+        # Should be unreachable: the proxy rejects unknown X-Industry-Type at the
+        # top of the pipeline. Fail-closed if we ever get here anyway — never let
+        # a request skip the guardrail check silently.
         request.state.pipeline_timing["guardrails"] = (time.monotonic() - start) * 1000
-        return
+        log.error(
+            "guardrails_no_policy",
+            industry_type=industry_type,
+            org_id=org_id,
+            request_id=request_id,
+            pipeline_step="guardrails",
+        )
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "invalid_industry_type", "message": "Unknown or missing X-Industry-Type"},
+        )
 
     body = getattr(request.state, "parsed_body", None)
     if body is None:
@@ -173,17 +260,24 @@ async def guardrails_middleware(request: Request) -> None:
     if keyword_hit:
         _set_state_and_raise(request, keyword_hit, policy.name, start, "keyword")
 
-    # ── Layer 2: Embedding similarity ───────────────────────────────────────
+    # ── Layer 2: Prompt-injection heuristics ───────────────────────────────
+    if settings.GUARDRAIL_PROMPT_INJECTION_ENABLED:
+        injection_hit = _check_prompt_injection(prompt_text)
+        if injection_hit:
+            _set_state_and_raise(
+                request, f"prompt_injection:{injection_hit}", policy.name, start, "prompt_injection"
+            )
+
+    # ── Layer 3: Embedding similarity ──────────────────────────────────────
     model = get_embedding_model()
     prompt_embedding = model.encode([prompt_text], normalize_embeddings=True)[0]
+    threshold = settings.EMBEDDING_SIMILARITY_THRESHOLD
 
-    # Try org-specific pgvector embeddings first
-    db_result = await _load_db_embeddings(org_id, policy.name)
-
-    if db_result is not None:
-        embs, topics = db_result
-        topic_hit = _check_embedding_similarity(prompt_embedding, embs, topics)
-        source = "pgvector"
+    if await _org_has_db_embeddings(org_id, policy.name):
+        # Nearest prohibited topic computed in Postgres via the ivfflat index.
+        nearest = await _query_nearest_topic_db(org_id, policy.name, prompt_embedding)
+        topic_hit = nearest[0] if (nearest and nearest[1] >= threshold) else None
+        source = "pgvector_ivfflat"
     else:
         # Fall back to default in-process embeddings
         default_embs = _default_embeddings_cache.get(policy.name)
@@ -191,7 +285,9 @@ async def guardrails_middleware(request: Request) -> None:
             # Warm up on-demand (first request before lifespan ran, e.g. in tests)
             default_embs = model.encode(policy.prohibited_topics, normalize_embeddings=True)
             _default_embeddings_cache[policy.name] = default_embs
-        topic_hit = _check_embedding_similarity(prompt_embedding, default_embs, policy.prohibited_topics)
+        topic_hit = _check_embedding_similarity(
+            prompt_embedding, default_embs, policy.prohibited_topics, threshold
+        )
         source = "in_process"
 
     if topic_hit:
@@ -214,7 +310,7 @@ async def guardrails_middleware(request: Request) -> None:
         org_id=org_id,
         request_id=request_id,
         pipeline_step="guardrails",
-        embedding_source=source if db_result is not None else "in_process",
+        embedding_source=source,
         elapsed_ms=round(elapsed, 2),
     )
 

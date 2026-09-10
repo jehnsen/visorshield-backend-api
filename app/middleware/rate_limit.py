@@ -1,5 +1,6 @@
 import time
 import asyncio
+import hashlib
 from datetime import datetime, timezone
 from calendar import monthrange
 import structlog
@@ -10,6 +11,19 @@ from app.config import settings
 log = structlog.get_logger()
 
 _redis_client: aioredis.Redis | None = None
+
+
+def _api_key_hash(claims: dict) -> str:
+    """
+    Redis namespace component identifying the calling API key.
+
+    Derived from the JWT-signed ``sub`` claim (the api_key_id), never from a
+    client-supplied header. A caller could otherwise send a fresh ``X-API-Key``
+    on every request to get a brand-new RPM window and monthly token counter,
+    bypassing both rate limiting and quota enforcement.
+    """
+    sub = claims.get("sub") or "unknown"
+    return hashlib.sha256(str(sub).encode()).hexdigest()[:32]
 
 
 def get_redis() -> aioredis.Redis:
@@ -32,7 +46,7 @@ async def rate_limit_middleware(request: Request) -> None:
 
     claims = getattr(request.state, "jwt_claims", {})
     org_id = claims.get("org_id", "unknown")
-    api_key = request.headers.get("X-API-Key", "default")
+    api_key_hash = _api_key_hash(claims)
     rpm_limit = int(claims.get("rpm_limit", 60))
     monthly_budget = int(claims.get("monthly_token_budget", 1_000_000))
 
@@ -40,7 +54,7 @@ async def rate_limit_middleware(request: Request) -> None:
     request_id = getattr(request.state, "request_id", "")
 
     # --- Spike Arrest: sliding window per-minute counter ---
-    rpm_key = f"visorshield:{org_id}:{api_key}:rpm"
+    rpm_key = f"visorshield:{org_id}:{api_key_hash}:rpm"
     now_ts = int(time.time())
     window_start = now_ts - 60
 
@@ -68,7 +82,7 @@ async def rate_limit_middleware(request: Request) -> None:
 
     # --- Monthly Token Quota Check ---
     now = datetime.now(timezone.utc)
-    monthly_key = f"visorshield:{org_id}:{api_key}:monthly_tokens:{now.year}:{now.month}"
+    monthly_key = f"visorshield:{org_id}:{api_key_hash}:monthly_tokens:{now.year}:{now.month}"
     used_tokens = await redis.get(monthly_key)
     used_tokens = int(used_tokens) if used_tokens else 0
 

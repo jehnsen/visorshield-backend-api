@@ -11,6 +11,43 @@ from app.models.audit import Transaction, GuardrailIncident
 router = APIRouter(prefix="/audit", tags=["audit"])
 
 
+def _resolve_org_scope(claims: dict, requested_org_id: Optional[str]) -> Optional[uuid.UUID]:
+    """
+    Determine which org's records the caller is allowed to read.
+
+    - role == "admin": may target any org via the ?org_id query param, or all
+      orgs when it is omitted (returns None => no org filter).
+    - role == "compliance_officer": always locked to the org_id in their token.
+      Supplying a ?org_id for a different org is rejected with 403; omitting it
+      simply scopes to their own org.
+
+    The scope is derived from the verified JWT claims, never from a bare
+    caller-supplied query param.
+    """
+    role = claims.get("role", "user")
+    token_org = claims.get("org_id")
+
+    requested_uuid: Optional[uuid.UUID] = None
+    if requested_org_id:
+        try:
+            requested_uuid = uuid.UUID(requested_org_id)
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=422, detail={"error": "invalid_org_id"})
+
+    if role == "admin":
+        return requested_uuid  # None => all orgs
+
+    # compliance_officer — require_compliance_or_admin() already gated the role
+    try:
+        token_org_uuid = uuid.UUID(token_org)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=403, detail={"error": "org_scope_unavailable"})
+
+    if requested_uuid is not None and requested_uuid != token_org_uuid:
+        raise HTTPException(status_code=403, detail={"error": "org_scope_forbidden"})
+    return token_org_uuid
+
+
 @router.get("/transactions")
 async def list_transactions(
     org_id: Optional[str] = Query(None),
@@ -21,11 +58,12 @@ async def list_transactions(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
-    _claims: dict = Depends(require_compliance_or_admin()),
+    claims: dict = Depends(require_compliance_or_admin()),
 ):
     filters = []
-    if org_id:
-        filters.append(Transaction.org_id == uuid.UUID(org_id))
+    org_scope = _resolve_org_scope(claims, org_id)
+    if org_scope is not None:
+        filters.append(Transaction.org_id == org_scope)
     if date_from:
         filters.append(Transaction.created_at >= date_from)
     if date_to:
@@ -83,11 +121,13 @@ async def list_transactions(
 async def get_transaction(
     transaction_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _claims: dict = Depends(require_compliance_or_admin()),
+    claims: dict = Depends(require_compliance_or_admin()),
 ):
+    org_scope = _resolve_org_scope(claims, None)
     result = await db.execute(select(Transaction).where(Transaction.id == transaction_id))
     tx = result.scalar_one_or_none()
-    if not tx:
+    # 404 (not 403) when out of scope so record existence isn't leaked cross-tenant
+    if not tx or (org_scope is not None and tx.org_id != org_scope):
         raise HTTPException(status_code=404, detail={"error": "transaction_not_found"})
 
     return {
@@ -119,11 +159,12 @@ async def list_incidents(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
-    _claims: dict = Depends(require_compliance_or_admin()),
+    claims: dict = Depends(require_compliance_or_admin()),
 ):
     filters = []
-    if org_id:
-        filters.append(GuardrailIncident.org_id == uuid.UUID(org_id))
+    org_scope = _resolve_org_scope(claims, org_id)
+    if org_scope is not None:
+        filters.append(GuardrailIncident.org_id == org_scope)
     if policy_profile:
         filters.append(GuardrailIncident.policy_profile == policy_profile)
 
@@ -164,11 +205,12 @@ async def list_incidents(
 async def audit_summary(
     org_id: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
-    _claims: dict = Depends(require_compliance_or_admin()),
+    claims: dict = Depends(require_compliance_or_admin()),
 ):
+    org_scope = _resolve_org_scope(claims, org_id)
     filters = []
-    if org_id:
-        filters.append(Transaction.org_id == uuid.UUID(org_id))
+    if org_scope is not None:
+        filters.append(Transaction.org_id == org_scope)
 
     tx_q = select(
         func.count(Transaction.id).label("total_requests"),
@@ -190,8 +232,8 @@ async def audit_summary(
 
     # Guardrail hits
     g_filters = []
-    if org_id:
-        g_filters.append(GuardrailIncident.org_id == uuid.UUID(org_id))
+    if org_scope is not None:
+        g_filters.append(GuardrailIncident.org_id == org_scope)
     g_q = select(func.count(GuardrailIncident.id))
     if g_filters:
         g_q = g_q.where(and_(*g_filters))

@@ -158,7 +158,8 @@ async def route_request(
 
         if response is None:
             from fastapi import HTTPException
-            raise HTTPException(status_code=503, detail={"error": "all_providers_failed"})
+            # Failure-mode contract: LLM provider 5xx → retry once → fallback → 502
+            raise HTTPException(status_code=502, detail={"error": "all_providers_failed"})
 
         if provider == "anthropic":
             result = _normalize_anthropic_response(response, target_model)

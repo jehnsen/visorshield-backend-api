@@ -1,6 +1,5 @@
 import uuid
-from datetime import datetime
-from sqlalchemy import Column, String, Integer, BigInteger, Boolean, Numeric, TIMESTAMP, Text, ForeignKey
+from sqlalchemy import Column, String, Integer, BigInteger, Boolean, Numeric, TIMESTAMP, Text, ForeignKey, func
 from sqlalchemy.dialects.postgresql import UUID, JSONB, ARRAY
 from sqlalchemy.orm import relationship
 from app.db.database import Base
@@ -16,7 +15,7 @@ class Organization(Base):
     requests_per_second_limit = Column(Integer, default=10)
     allowed_models = Column(ARRAY(Text), default=["gpt-4o-mini"])
     is_active = Column(Boolean, default=True, nullable=False)
-    created_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+    created_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
 
     api_keys = relationship("APIKey", back_populates="organization")
     transactions = relationship("Transaction", back_populates="organization")
@@ -30,7 +29,7 @@ class APIKey(Base):
     key_hash = Column(String(255), unique=True, nullable=False)
     label = Column(String(100))
     is_active = Column(Boolean, default=True, nullable=False)
-    created_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+    created_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
 
     organization = relationship("Organization", back_populates="api_keys")
 
@@ -55,7 +54,7 @@ class Transaction(Base):
     latency_ms = Column(Integer)
     industry_type = Column(String(50))
     routing_reason = Column(String(100))
-    created_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+    created_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
 
     organization = relationship("Organization", back_populates="transactions")
 
@@ -71,4 +70,4 @@ class GuardrailIncident(Base):
     violation_category = Column(String(100))
     detection_layer = Column(String(20))
     prompt_hash = Column(String(64))
-    created_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+    created_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
