@@ -95,7 +95,7 @@ Built for SOC2 audits, COA transparency requirements, and DPO reviews.
 ### Prerequisites
 
 - Docker + Docker Compose
-- Python 3.12+ (for local dev)
+- Python 3.12 (for local dev — **not 3.13+**; spaCy/thinc/blis and asyncpg have no 3.13 wheels, so `pip install` falls back to source builds that fail)
 - OpenAI and/or Anthropic API keys
 
 ### 1. Clone and configure
@@ -242,8 +242,16 @@ X-VisorShield-Model-Used: gpt-4o-mini
 ## Running Tests
 
 ```bash
+# Create a virtualenv on Python 3.12 (not 3.13+ — see Prerequisites)
+python3.12 -m venv .venv
+source .venv/bin/activate
+
 # Install dev dependencies
 pip install -r requirements.txt
+
+# Download the spaCy model Presidio needs (~400MB, first run only).
+# test_pii.py builds a real AnalyzerEngine, so tests fail without it.
+python -m spacy download en_core_web_lg
 
 # Run all tests
 pytest tests/ -v --tb=short
@@ -342,6 +350,13 @@ See `app/policies/govtech.py` as the reference implementation (includes custom P
 - JWT secrets should be rotated regularly and stored in a secrets manager in production.
 
 ---
+
+New Endpoints &	What it does:
+POST /v1/extension/scan	Steps 1–4 on a captured prompt → masked text + entity map, or 451
+POST /v1/extension/response-scan	Step 5 on the assistant's answer; types + placeholders only
+GET /v1/extension/policy	Device policy, fail_mode: closed
+POST /v1/extension/events	Metadata-only telemetry
+POST /v1/extension/heartbeat	Device liveness
 
 ## License
 

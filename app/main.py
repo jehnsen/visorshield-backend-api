@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from app.config import settings
-from app.routers import proxy, audit, admin
+from app.routers import proxy, audit, admin, extension
 from app.db.database import check_db_health
 from app.middleware.rate_limit import get_redis
 from app.middleware.pii_engine import get_analyzer
@@ -85,6 +85,7 @@ async def request_id_middleware(request: Request, call_next):
 
 
 app.include_router(proxy.router)
+app.include_router(extension.router)
 app.include_router(audit.router)
 app.include_router(admin.router)
 
