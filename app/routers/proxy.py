@@ -98,7 +98,7 @@ async def chat_completions(request: Request):
                     compliance_status="blocked",
                     guardrail_triggered=getattr(request.state, "guardrail_triggered", None),
                     latency_ms=int((time.monotonic() - request.state._pipeline_start) * 1000),
-                    industry_type=request.headers.get("X-Industry-Type", ""),
+                    industry_type=claims.get("industry_type") or request.headers.get("X-Industry-Type", ""),
                     routing_reason="guardrail_block",
                     transaction_id=tx_id,
                 )
@@ -107,7 +107,7 @@ async def chat_completions(request: Request):
                 log_guardrail_incident(
                     org_id=claims.get("org_id", "unknown"),
                     transaction_id=tx_id,
-                    policy_profile=request.headers.get("X-Industry-Type", ""),
+                    policy_profile=claims.get("industry_type") or request.headers.get("X-Industry-Type", ""),
                     violation_category=getattr(request.state, "guardrail_triggered", "unknown"),
                     detection_layer=getattr(request.state, "guardrail_layer", "unknown"),
                     prompt_hash=getattr(request.state, "prompt_hash", ""),
@@ -193,7 +193,7 @@ async def chat_completions(request: Request):
             compliance_status="pass",
             guardrail_triggered=None,
             latency_ms=latency_ms,
-            industry_type=request.headers.get("X-Industry-Type", ""),
+            industry_type=claims.get("industry_type") or request.headers.get("X-Industry-Type", ""),
             routing_reason=routing_reason,
         )
     )
@@ -338,7 +338,7 @@ async def _stream_response(
             compliance_status="pass",
             guardrail_triggered=None,
             latency_ms=latency_ms,
-            industry_type=request.headers.get("X-Industry-Type", ""),
+            industry_type=claims.get("industry_type") or request.headers.get("X-Industry-Type", ""),
             routing_reason=routing_reason,
         )
     )

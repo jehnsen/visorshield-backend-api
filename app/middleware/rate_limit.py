@@ -19,7 +19,7 @@ def _api_key_hash(claims: dict) -> str:
 
     Derived from the JWT-signed ``sub`` claim (the api_key_id), never from a
     client-supplied header. A caller could otherwise send a fresh ``X-API-Key``
-    on every request to get a brand-new RPM window and monthly token counter,
+    on every request to get a brand-new RPS window and monthly token counter,
     bypassing both rate limiting and quota enforcement.
     """
     sub = claims.get("sub") or "unknown"
@@ -47,37 +47,40 @@ async def rate_limit_middleware(request: Request) -> None:
     claims = getattr(request.state, "jwt_claims", {})
     org_id = claims.get("org_id", "unknown")
     api_key_hash = _api_key_hash(claims)
-    rpm_limit = int(claims.get("rpm_limit", 60))
+    # Single canonical unit across DB (Organization.requests_per_second_limit),
+    # JWT claim (requests_per_second — see CLAUDE.md JWT Claims Schema) and
+    # enforcement here: a literal per-second cap, not "per minute".
+    rps_limit = int(claims.get("requests_per_second", 10))
     monthly_budget = int(claims.get("monthly_token_budget", 1_000_000))
 
     redis = get_redis()
     request_id = getattr(request.state, "request_id", "")
 
-    # --- Spike Arrest: sliding window per-minute counter ---
-    rpm_key = f"visorshield:{org_id}:{api_key_hash}:rpm"
+    # --- Spike Arrest: sliding 1-second window counter ---
+    rps_key = f"visorshield:{org_id}:{api_key_hash}:rps"
     now_ts = int(time.time())
-    window_start = now_ts - 60
+    window_start = now_ts - 1
 
     pipe = redis.pipeline()
-    pipe.zremrangebyscore(rpm_key, "-inf", window_start)
-    pipe.zadd(rpm_key, {f"{now_ts}:{request_id}": now_ts})
-    pipe.zcard(rpm_key)
-    pipe.expire(rpm_key, 120)
+    pipe.zremrangebyscore(rps_key, "-inf", window_start)
+    pipe.zadd(rps_key, {f"{now_ts}:{request_id}": now_ts})
+    pipe.zcard(rps_key)
+    pipe.expire(rps_key, 5)
     results = await pipe.execute()
 
-    current_rpm = results[2]
-    if current_rpm > rpm_limit:
+    current_rps = results[2]
+    if current_rps > rps_limit:
         log.warning(
             "rate_limit_exceeded",
             org_id=org_id,
-            current_rpm=current_rpm,
-            rpm_limit=rpm_limit,
+            current_rps=current_rps,
+            rps_limit=rps_limit,
             request_id=request_id,
             pipeline_step="rate_limit",
         )
         raise HTTPException(
             status_code=429,
-            detail={"error": "rate_limit_exceeded", "retry_after_seconds": 60},
+            detail={"error": "rate_limit_exceeded", "retry_after_seconds": 1},
         )
 
     # --- Monthly Token Quota Check ---
@@ -115,7 +118,7 @@ async def rate_limit_middleware(request: Request) -> None:
     # Store keys in state so audit service can increment after response
     request.state.rate_limit_keys = {
         "monthly_key": monthly_key,
-        "rpm_key": rpm_key,
+        "rps_key": rps_key,
         "monthly_budget": monthly_budget,
     }
 
@@ -125,7 +128,7 @@ async def rate_limit_middleware(request: Request) -> None:
     log.info(
         "rate_limit_passed",
         org_id=org_id,
-        current_rpm=current_rpm,
+        current_rps=current_rps,
         used_tokens=used_tokens,
         monthly_budget=monthly_budget,
         request_id=request_id,

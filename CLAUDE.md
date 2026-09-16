@@ -91,7 +91,11 @@ visorshield/
 Incoming Request
       │
       ▼
-[1] auth.py          → Validate JWT. Extract org_id, allowed_models, role.
+[1] auth.py          → Validate JWT. Cross-check X-Industry-Type header against
+                        the token's industry_type claim (mismatch = 403).
+                        Load live org/key state from the DB — allowed_models,
+                        requests_per_second, monthly_token_budget override the
+                        token's own copies. Extract org_id, role.
       │
       ▼
 [2] rate_limit.py    → Redis spike arrest + monthly token quota check.
@@ -122,6 +126,8 @@ Client Response
 | Step | Failure Behavior | HTTP Code |
 |---|---|---|
 | Auth failure | Block. Return error. | 401 / 403 |
+| X-Industry-Type / JWT industry_type mismatch | Block. Never silently pick either value. | 403 |
+| Auth DB unreachable (org/key active check) | **Fail-closed. Block request.** (see `AUTH_FAIL_OPEN_ON_DB_ERROR`) | 503 |
 | Rate limit exceeded | Block. Return reset_date. | 429 |
 | PII scan exception | **Fail-closed. Block request.** | 500 |
 | Guardrails hit | Block. Log incident. Never forward to LLM. | 451 |
@@ -129,6 +135,8 @@ Client Response
 | LLM provider 5xx | Retry once → fallback provider → 502 | 502 |
 
 **The PII engine must always fail-closed.** If Presidio throws any exception, the request is blocked. Never fail-open on PII.
+
+**The auth DB check must default to fail-closed too.** If the org/API-key active check in `auth.py` can't reach Postgres, block the request (503) rather than let a possibly-revoked key or deactivated org through as "unknown". `AUTH_FAIL_OPEN_ON_DB_ERROR` exists to relax this outside production only — `config.py` refuses to start in production with it set.
 
 ---
 
@@ -160,14 +168,21 @@ These live in `app/policies/govtech.py`. If BIR or PSA changes formats, update t
 All Redis keys must be namespaced. Never use bare keys.
 
 ```
-visorshield:{org_id}:{api_key_hash}:rpm          # requests per minute counter
+visorshield:{org_id}:{api_key_hash}:rps          # requests per second counter (sliding 1s window)
 visorshield:{org_id}:{api_key_hash}:monthly_tokens  # monthly token accumulator
 visorshield:{org_id}:budget_alert_sent           # flag: monthly alert already sent
 ```
 
 TTL rules:
-- `rpm` key: 60 seconds
+- `rps` key: ~5 seconds (just long enough to cover clock skew on the 1s window)
 - `monthly_tokens` key: expires on 1st of next month (compute dynamically)
+
+The rate limit is a literal **requests-per-second** value — same unit as the
+`requests_per_second` JWT claim below and the `requests_per_second_limit`
+column on `organizations`. Do not reintroduce a "per minute" reading of this
+number anywhere (claim name, Redis key, or comparison window) — that was a
+real bug (three different contracts for one number) and caused the spike
+arrest to be ~60x too permissive.
 
 ---
 
@@ -192,6 +207,16 @@ Every valid JWT must contain these claims:
 - `role: app` — can call `/v1/chat/completions` only
 - `role: compliance_officer` — can call `/audit/*` endpoints
 - `role: admin` — can call all endpoints including `/admin/*`
+- `industry_type` is **required** and `auth.py` rejects the request (403) if the
+  `X-Industry-Type` header doesn't match it exactly. The header alone is never
+  trusted for policy selection — a caller sending a different header than the
+  claim would otherwise get a different (weaker) entity list / blocklist than
+  their org was issued.
+- `allowed_models`, `requests_per_second`, and `monthly_token_budget` in the
+  token are **defaults only**. `auth.py` overwrites them at request time with
+  the live values from the `organizations` row (via `/admin/organizations`),
+  so an admin-changed budget or model list takes effect immediately without
+  waiting for tokens to expire and be reminted.
 
 ---
 
@@ -282,6 +307,7 @@ JWT_ALGORITHM=HS256
 DEFAULT_PROVIDER=openai
 FALLBACK_PROVIDER=anthropic
 ENVIRONMENT=development
+AUTH_FAIL_OPEN_ON_DB_ERROR=false  # never true in production — see Failure Modes
 ```
 
 ---
@@ -329,3 +355,5 @@ pytest tests/ -v --tb=short
 - **Never hardcode org_id or api keys** in test files — use fixtures.
 - **Never reorder the interceptor pipeline** steps without updating this file.
 - **Never log PII values** — log entity types only (e.g., `"PERSON"` not `"Juan dela Cruz"`).
+- **Never select a policy profile from the raw `X-Industry-Type` header.** Only use it after `auth.py` has confirmed it matches the JWT's `industry_type` claim; downstream steps (`pii_engine.py`, `guardrails.py`) read `request.state.jwt_claims["industry_type"]`, not the header.
+- **Never fall back to JWT-only org limits when the DB fetch in `auth.py` succeeds.** The DB row is authoritative for `allowed_models`, `requests_per_second`, and `monthly_token_budget`; the JWT values are only a fallback for when the DB check itself is skipped or explicitly fails open.

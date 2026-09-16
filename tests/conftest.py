@@ -13,8 +13,9 @@ def make_jwt(
     app_source="test-app",
     allowed_models=None,
     role="user",
-    rpm_limit=100,
+    requests_per_second=100,
     monthly_token_budget=1_000_000,
+    industry_type="healthcare",
     expire_offset=3600,
 ):
     if allowed_models is None:
@@ -25,8 +26,9 @@ def make_jwt(
         "app_source": app_source,
         "allowed_models": allowed_models,
         "role": role,
-        "rpm_limit": rpm_limit,
+        "requests_per_second": requests_per_second,
         "monthly_token_budget": monthly_token_budget,
+        "industry_type": industry_type,
         "exp": int(time.time()) + expire_offset,
         "iat": int(time.time()),
     }

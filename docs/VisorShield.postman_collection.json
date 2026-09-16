@@ -1,0 +1,680 @@
+{
+  "info": {
+    "_postman_id": "b6e1c2a4-9d3f-4e7a-8c2b-1f5a7d0e4c9b",
+    "name": "VisorShield — Universal AI Governance Proxy",
+    "description": "Sample client: **Metro Pacific BPO Solutions Inc.**, a Philippine BPO with four lines of business, each mapped to a VisorShield industry profile:\n\n- **govtech** — LGU citizen hotline (Barangay/city hall transactions, PH_TIN/PH_SSS/PH_PHILSYS)\n- **healthcare** — after-hours nurse triage line for a US clinic client (HIPAA)\n- **fintech** — bank collections/customer support line (PCI-DSS)\n- **legal_hr** — internal HR shared-services helpdesk for Metro Pacific's own employees\n\n## Auth\nVisorShield has no `/login` endpoint — JWTs are minted out-of-band and validated with `JWT_SECRET` (HS256). This collection's **collection-level Pre-request Script** mints short-lived `app` / `admin` / `compliance_officer` tokens on every request using CryptoJS (bundled in the Postman sandbox), signed with the `jwt_secret` collection variable.\n\n**Before running:** set `jwt_secret` to match your server's `JWT_SECRET` env var (defaults to `change-me-in-production` in `app/config.py` for local dev — already set below). Set `base_url` to your running instance (default `http://localhost:8000`).\n\n## Flow\n1. Run **Admin → Create Organization** first — it captures the new `org_id` into `org_id_created` and chains into the rest of the Admin folder.\n2. Proxy/Extension requests use `org_id` (a fixed seeded org) by default — swap to `org_id_created` if you want to exercise a freshly created org end-to-end.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base_url", "value": "http://localhost:8000", "type": "string" },
+    { "key": "jwt_secret", "value": "change-me-in-production", "type": "string" },
+    { "key": "org_id", "value": "08a63847-fecb-4698-829a-f71895202a8d", "type": "string" },
+    { "key": "org_name", "value": "Metro Pacific BPO Solutions Inc.", "type": "string" },
+    { "key": "api_key_id_app", "value": "b8463e33-a291-4bb7-9720-a65e34a82b88", "type": "string" },
+    { "key": "api_key_id_admin", "value": "04597cb2-367b-4092-bb07-1d3ad098daa6", "type": "string" },
+    { "key": "api_key_id_compliance", "value": "6120edfc-13f2-4d46-accd-81e0ea2b3bd1", "type": "string" },
+    { "key": "jwt_app", "value": "", "type": "string" },
+    { "key": "jwt_admin", "value": "", "type": "string" },
+    { "key": "jwt_compliance", "value": "", "type": "string" },
+    { "key": "transaction_id_sample", "value": "be590540-51e8-40b3-bb02-0acefacd688f", "type": "string" },
+    { "key": "device_id", "value": "fafefb1f-a7ac-4dd8-aa75-46192887d27e", "type": "string" },
+    { "key": "key_id_to_revoke", "value": "4ea96437-3ca3-4c4d-a8a0-73789f8212a1", "type": "string" },
+    { "key": "org_id_created", "value": "", "type": "string" },
+    { "key": "api_key_id_created", "value": "", "type": "string" }
+  ],
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Mints fresh HS256 JWTs for the app/admin/compliance_officer roles on",
+          "// every request, since VisorShield has no /login endpoint — tokens are",
+          "// issued out-of-band and only need to satisfy app/middleware/auth.py.",
+          "// Uses CryptoJS, which ships in the Postman sandbox.",
+          "",
+          "function base64url(wordArray) {",
+          "    return CryptoJS.enc.Base64.stringify(wordArray)",
+          "        .replace(/=+$/, '')",
+          "        .replace(/\\+/g, '-')",
+          "        .replace(/\\//g, '_');",
+          "}",
+          "",
+          "function signJwt(payload, secret) {",
+          "    const header = { alg: 'HS256', typ: 'JWT' };",
+          "    const encHeader = base64url(CryptoJS.enc.Utf8.parse(JSON.stringify(header)));",
+          "    const encPayload = base64url(CryptoJS.enc.Utf8.parse(JSON.stringify(payload)));",
+          "    const signingInput = encHeader + '.' + encPayload;",
+          "    const signature = base64url(CryptoJS.HmacSHA256(signingInput, secret));",
+          "    return signingInput + '.' + signature;",
+          "}",
+          "",
+          "const secret = pm.collectionVariables.get('jwt_secret');",
+          "const orgId = pm.collectionVariables.get('org_id');",
+          "const now = Math.floor(Date.now() / 1000);",
+          "const allowedModels = ['gpt-4o-mini', 'gpt-4o', 'claude-haiku-4-5', 'claude-sonnet-4-5'];",
+          "",
+          "const roles = [",
+          "    { varName: 'jwt_app', role: 'app', sub: pm.collectionVariables.get('api_key_id_app'), rpm: 20 },",
+          "    { varName: 'jwt_admin', role: 'admin', sub: pm.collectionVariables.get('api_key_id_admin'), rpm: 50 },",
+          "    { varName: 'jwt_compliance', role: 'compliance_officer', sub: pm.collectionVariables.get('api_key_id_compliance'), rpm: 50 }",
+          "];",
+          "",
+          "roles.forEach(function (r) {",
+          "    const payload = {",
+          "        sub: r.sub,",
+          "        org_id: orgId,",
+          "        app_source: 'BPO-CRM-Widget',",
+          "        role: r.role,",
+          "        allowed_models: allowedModels,",
+          "        rpm_limit: r.rpm,",
+          "        monthly_token_budget: 5000000,",
+          "        allow_streaming_passthrough: false,",
+          "        iat: now,",
+          "        exp: now + 3600",
+          "    };",
+          "    pm.collectionVariables.set(r.varName, signJwt(payload, secret));",
+          "});"
+        ]
+      }
+    }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "Health Check",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{base_url}}/health", "host": ["{{base_url}}"], "path": ["health"] },
+            "description": "Liveness/readiness probe. Checks Postgres, Redis, Presidio and the embedding model. Returns 503 if any dependency is down."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Proxy — Chat Completions",
+      "item": [
+        {
+          "name": "Govtech — Citizen Hotline (Barangay clearance follow-up)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Industry-Type", "value": "govtech" },
+              { "key": "X-Org-ID", "value": "{{org_id}}" },
+              { "key": "Authorization", "value": "Bearer {{jwt_app}}" }
+            ],
+            "url": { "raw": "{{base_url}}/v1/chat/completions", "host": ["{{base_url}}"], "path": ["v1", "chat", "completions"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"gpt-4o-mini\",\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You are a customer support assistant for the City of Taguig 8888 Citizen Hotline, operated by Metro Pacific BPO Solutions Inc. Answer only questions about local government transactions.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"Hi, I'm following up on my Barangay clearance application. My name is Juan Dela Cruz, TIN 123-456-789-000, SSS 34-1234567-8, mobile +63 917 123 4567. Can you tell me the usual processing time?\"\n    }\n  ],\n  \"temperature\": 0.3,\n  \"max_tokens\": 300\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "PII in the prompt (PERSON, PH_TIN, PH_SSS, PHONE_NUMBER) should be masked by the govtech profile before it reaches the LLM. Check the `X-VisorShield-PII-Masked` response header."
+          },
+          "response": []
+        },
+        {
+          "name": "Healthcare — Nurse Triage Line (US clinic client)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Industry-Type", "value": "healthcare" },
+              { "key": "X-Org-ID", "value": "{{org_id}}" },
+              { "key": "Authorization", "value": "Bearer {{jwt_app}}" }
+            ],
+            "url": { "raw": "{{base_url}}/v1/chat/completions", "host": ["{{base_url}}"], "path": ["v1", "chat", "completions"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"gpt-4o\",\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You are a HIPAA-compliant after-hours nurse triage assistant for Sunrise Family Clinic's patient hotline, operated by Metro Pacific BPO Solutions Inc.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"Patient Maria Santos, DOB 1990-04-12, phone +1 (415) 555-0148, email maria.santos@example.com, is reporting a fever of 101F for the last two days. Should she go to the ER?\"\n    }\n  ],\n  \"temperature\": 0.2,\n  \"max_tokens\": 300\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "PERSON, DATE_TIME, PHONE_NUMBER and EMAIL_ADDRESS should be masked under the HIPAA/DPA (healthcare) profile."
+          },
+          "response": []
+        },
+        {
+          "name": "Fintech — Collections Line (bank client)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Industry-Type", "value": "fintech" },
+              { "key": "X-Org-ID", "value": "{{org_id}}" },
+              { "key": "Authorization", "value": "Bearer {{jwt_app}}" }
+            ],
+            "url": { "raw": "{{base_url}}/v1/chat/completions", "host": ["{{base_url}}"], "path": ["v1", "chat", "completions"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"claude-haiku-4-5\",\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You are a collections support assistant for BDO Unibank's overdue-accounts hotline, operated by Metro Pacific BPO Solutions Inc. Do not provide legal or financial advice.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"Customer Ana Reyes wants to set up a payment plan for her overdue balance. Card on file ends in 4111 1111 1111 1111. Her TIN is 123-456-789-000 for identity verification.\"\n    }\n  ],\n  \"temperature\": 0.3,\n  \"max_tokens\": 300\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "PCI-DSS/SEC profile — expects CREDIT_CARD and PH_TIN to be masked. Card number used is the well-known Visa test PAN (4111 1111 1111 1111), not a real card."
+          },
+          "response": []
+        },
+        {
+          "name": "Legal/HR — Internal HR Helpdesk",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Industry-Type", "value": "legal_hr" },
+              { "key": "X-Org-ID", "value": "{{org_id}}" },
+              { "key": "Authorization", "value": "Bearer {{jwt_app}}" }
+            ],
+            "url": { "raw": "{{base_url}}/v1/chat/completions", "host": ["{{base_url}}"], "path": ["v1", "chat", "completions"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"gpt-4o-mini\",\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You are an internal HR helpdesk assistant for Metro Pacific BPO Solutions Inc. employees.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"Employee Mark Villanueva, age 34, email mark.villanueva@metropacificbpo.com.ph, phone +63 918 555 2210, is asking about the maternity leave policy for his spouse who is also an employee here.\"\n    }\n  ],\n  \"temperature\": 0.3,\n  \"max_tokens\": 300\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "Bias/sensitivity profile — expects PERSON, AGE, EMAIL_ADDRESS and PHONE_NUMBER to be masked."
+          },
+          "response": []
+        },
+        {
+          "name": "Govtech — Streaming Response (SSE)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Industry-Type", "value": "govtech" },
+              { "key": "X-Org-ID", "value": "{{org_id}}" },
+              { "key": "Authorization", "value": "Bearer {{jwt_app}}" },
+              { "key": "Accept", "value": "text/event-stream" }
+            ],
+            "url": { "raw": "{{base_url}}/v1/chat/completions", "host": ["{{base_url}}"], "path": ["v1", "chat", "completions"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"gpt-4o-mini\",\n  \"messages\": [\n    { \"role\": \"user\", \"content\": \"What are the office hours for the Taguig City Hall business permits window?\" }\n  ],\n  \"stream\": true\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "By default the full response is buffered and PII-scanned before anything streams to the client (step 5 runs before any byte is sent), unless the org's JWT sets `allow_streaming_passthrough: true`."
+          },
+          "response": []
+        },
+        {
+          "name": "Govtech — Blocked (guardrail: election campaigning)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Industry-Type", "value": "govtech" },
+              { "key": "X-Org-ID", "value": "{{org_id}}" },
+              { "key": "Authorization", "value": "Bearer {{jwt_app}}" }
+            ],
+            "url": { "raw": "{{base_url}}/v1/chat/completions", "host": ["{{base_url}}"], "path": ["v1", "chat", "completions"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"gpt-4o-mini\",\n  \"messages\": [\n    { \"role\": \"user\", \"content\": \"Can you help me write campaign material urging residents to vote for Mayor Cruz in the upcoming barangay election?\" }\n  ]\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "Expected: HTTP 451. Hits the govtech keyword blocklist (\"vote for\", \"campaign material\") at the guardrails layer — never forwarded to the LLM."
+          },
+          "response": []
+        },
+        {
+          "name": "Fintech — Model Not Permitted (403)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Industry-Type", "value": "fintech" },
+              { "key": "X-Org-ID", "value": "{{org_id}}" },
+              { "key": "Authorization", "value": "Bearer {{jwt_app}}" }
+            ],
+            "url": { "raw": "{{base_url}}/v1/chat/completions", "host": ["{{base_url}}"], "path": ["v1", "chat", "completions"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"gpt-4-turbo\",\n  \"messages\": [\n    { \"role\": \"user\", \"content\": \"Summarize this customer's payment history.\" }\n  ]\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "Expected: HTTP 403 model_not_permitted. `gpt-4-turbo` is not in the token's `allowed_models` list minted by the collection's pre-request script."
+          },
+          "response": []
+        },
+        {
+          "name": "Missing X-Industry-Type Header (422)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Org-ID", "value": "{{org_id}}" },
+              { "key": "Authorization", "value": "Bearer {{jwt_app}}" }
+            ],
+            "url": { "raw": "{{base_url}}/v1/chat/completions", "host": ["{{base_url}}"], "path": ["v1", "chat", "completions"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"gpt-4o-mini\",\n  \"messages\": [\n    { \"role\": \"user\", \"content\": \"Hello, quick question about my account.\" }\n  ]\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "Expected: HTTP 422 invalid_industry_type. Fail-closed check — an unrecognized/missing profile is rejected before any pipeline step runs."
+          },
+          "response": []
+        },
+        {
+          "name": "Missing Authorization Header (401)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Industry-Type", "value": "govtech" },
+              { "key": "X-Org-ID", "value": "{{org_id}}" }
+            ],
+            "url": { "raw": "{{base_url}}/v1/chat/completions", "host": ["{{base_url}}"], "path": ["v1", "chat", "completions"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"gpt-4o-mini\",\n  \"messages\": [\n    { \"role\": \"user\", \"content\": \"Hello, quick question about my account.\" }\n  ]\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "Expected: HTTP 401 missing_or_invalid_token."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Browser Extension",
+      "item": [
+        {
+          "name": "Scan Composer Prompt (govtech, PH IDs)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Industry-Type", "value": "govtech" },
+              { "key": "X-Org-ID", "value": "{{org_id}}" },
+              { "key": "Authorization", "value": "Bearer {{jwt_app}}" }
+            ],
+            "url": { "raw": "{{base_url}}/v1/extension/scan", "host": ["{{base_url}}"], "path": ["v1", "extension", "scan"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"prompt\": \"Please help me draft an internal memo about employee Juan Dela Cruz, TIN 123-456-789-000, SSS 34-1234567-8, PhilSys ID 1234567890123456, contact +63 917 123 4567.\",\n  \"conversation_id\": null,\n  \"site\": \"chatgpt\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "Simulates the browser extension capturing a chatgpt.com composer prompt before it's sent. Response includes masked_prompt, per-entity map, risk_level and prior_flags_this_month.",
+            "event": [
+              {
+                "listen": "test",
+                "script": {
+                  "type": "text/javascript",
+                  "exec": [
+                    "if (pm.response.code === 200) {",
+                    "    const body = pm.response.json();",
+                    "    pm.collectionVariables.set('transaction_id_sample', body.transaction_id);",
+                    "}"
+                  ]
+                }
+              }
+            ]
+          },
+          "response": []
+        },
+        {
+          "name": "Scan Assistant Response",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Industry-Type", "value": "govtech" },
+              { "key": "X-Org-ID", "value": "{{org_id}}" },
+              { "key": "Authorization", "value": "Bearer {{jwt_app}}" }
+            ],
+            "url": { "raw": "{{base_url}}/v1/extension/response-scan", "host": ["{{base_url}}"], "path": ["v1", "extension", "response-scan"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"transaction_id\": \"{{transaction_id_sample}}\",\n  \"text\": \"Sure, here's a draft memo for Juan Dela Cruz (TIN 123-456-789-000): Please be advised that your Barangay clearance request is being processed...\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "Step 5 for the extension surface — audits PII the model introduced into its answer. Returns entity types + placeholders only, never original values."
+          },
+          "response": []
+        },
+        {
+          "name": "Get Device Policy",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{jwt_app}}" }
+            ],
+            "url": { "raw": "{{base_url}}/v1/extension/policy", "host": ["{{base_url}}"], "path": ["v1", "extension", "policy"] },
+            "description": "Device-side enforcement policy the extension caches (~10 min) for the calling org."
+          },
+          "response": []
+        },
+        {
+          "name": "Report Telemetry Events",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{jwt_app}}" }
+            ],
+            "url": { "raw": "{{base_url}}/v1/extension/events", "host": ["{{base_url}}"], "path": ["v1", "extension", "events"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"events\": [\n    {\n      \"type\": \"masked_sent\",\n      \"transaction_id\": \"{{transaction_id_sample}}\",\n      \"entity_counts\": { \"PERSON\": 1, \"PH_TIN\": 1, \"PH_SSS\": 1, \"PHONE_NUMBER\": 1 },\n      \"client_ts\": \"2026-09-16T09:15:00+08:00\"\n    },\n    {\n      \"type\": \"cancelled_after_review\",\n      \"category\": \"user_declined_mask\",\n      \"client_ts\": \"2026-09-16T09:17:30+08:00\"\n    }\n  ]\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "Metadata-only telemetry sink — the model rejects any event carrying prompt text (extra=\"forbid\")."
+          },
+          "response": []
+        },
+        {
+          "name": "Device Heartbeat",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{jwt_app}}" }
+            ],
+            "url": { "raw": "{{base_url}}/v1/extension/heartbeat", "host": ["{{base_url}}"], "path": ["v1", "extension", "heartbeat"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"device_id\": \"{{device_id}}\",\n  \"extension_version\": \"1.4.2\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "Liveness ping so the compliance dashboard can show which agent workstations are actively protected."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Audit",
+      "item": [
+        {
+          "name": "List Transactions",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{jwt_compliance}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/audit/transactions?page=1&page_size=25&industry_type=govtech",
+              "host": ["{{base_url}}"],
+              "path": ["audit", "transactions"],
+              "query": [
+                { "key": "page", "value": "1" },
+                { "key": "page_size", "value": "25" },
+                { "key": "industry_type", "value": "govtech" },
+                { "key": "compliance_status", "value": "pass", "disabled": true },
+                { "key": "date_from", "value": "2026-09-01T00:00:00Z", "disabled": true },
+                { "key": "date_to", "value": "2026-09-30T23:59:59Z", "disabled": true },
+                { "key": "org_id", "value": "{{org_id}}", "disabled": true }
+              ]
+            },
+            "description": "compliance_officer is locked to their own org (from the JWT); admin may pass ?org_id for any org or omit it for all orgs."
+          },
+          "response": []
+        },
+        {
+          "name": "Get Transaction by ID",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{jwt_compliance}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/audit/transactions/{{transaction_id_sample}}",
+              "host": ["{{base_url}}"],
+              "path": ["audit", "transactions", "{{transaction_id_sample}}"]
+            },
+            "description": "404 (not 403) is returned when the transaction is out of the caller's org scope, so record existence isn't leaked cross-tenant."
+          },
+          "response": []
+        },
+        {
+          "name": "List Guardrail Incidents",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{jwt_compliance}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/audit/incidents?page=1&page_size=25&policy_profile=govtech",
+              "host": ["{{base_url}}"],
+              "path": ["audit", "incidents"],
+              "query": [
+                { "key": "page", "value": "1" },
+                { "key": "page_size", "value": "25" },
+                { "key": "policy_profile", "value": "govtech" }
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Compliance Summary",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{jwt_compliance}}" }
+            ],
+            "url": { "raw": "{{base_url}}/audit/summary", "host": ["{{base_url}}"], "path": ["audit", "summary"] },
+            "description": "Aggregate totals for the caller's org: requests, tokens, cost, PII events prevented, guardrail hits, compliance rate."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Admin",
+      "item": [
+        {
+          "name": "Create Organization (Metro Pacific BPO)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{jwt_admin}}" }
+            ],
+            "url": { "raw": "{{base_url}}/admin/organizations", "host": ["{{base_url}}"], "path": ["admin", "organizations"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"{{org_name}}\",\n  \"industry_type\": \"govtech\",\n  \"monthly_token_budget\": 5000000,\n  \"requests_per_second_limit\": 20,\n  \"allowed_models\": [\"gpt-4o-mini\", \"gpt-4o\", \"claude-haiku-4-5\", \"claude-sonnet-4-5\"]\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "Onboards Metro Pacific BPO Solutions Inc. under the govtech profile for its Citizen Hotline line of business.",
+            "event": [
+              {
+                "listen": "test",
+                "script": {
+                  "type": "text/javascript",
+                  "exec": [
+                    "if (pm.response.code === 201) {",
+                    "    const body = pm.response.json();",
+                    "    pm.collectionVariables.set('org_id_created', body.id);",
+                    "}"
+                  ]
+                }
+              }
+            ]
+          },
+          "response": []
+        },
+        {
+          "name": "Update Organization",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{jwt_admin}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/admin/organizations/{{org_id_created}}",
+              "host": ["{{base_url}}"],
+              "path": ["admin", "organizations", "{{org_id_created}}"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"monthly_token_budget\": 8000000,\n  \"allowed_models\": [\"gpt-4o-mini\", \"gpt-4o\", \"claude-haiku-4-5\", \"claude-sonnet-4-5\", \"claude-opus-4-5\"]\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "Raises the monthly budget after Metro Pacific added a second BPO seat cluster for the Citizen Hotline. Partial update — only provided fields change."
+          },
+          "response": []
+        },
+        {
+          "name": "Get Organization Usage (current month)",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{jwt_admin}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/admin/organizations/{{org_id_created}}/usage",
+              "host": ["{{base_url}}"],
+              "path": ["admin", "organizations", "{{org_id_created}}", "usage"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Create API Key",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{jwt_admin}}" }
+            ],
+            "url": { "raw": "{{base_url}}/admin/api-keys", "host": ["{{base_url}}"], "path": ["admin", "api-keys"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"org_id\": \"{{org_id_created}}\",\n  \"label\": \"Citizen Hotline - Production CRM Widget\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "The raw key is returned once and never shown again — store it securely. It is NOT the same thing as the collection's self-signed JWTs, which authenticate against JWT_SECRET directly.",
+            "event": [
+              {
+                "listen": "test",
+                "script": {
+                  "type": "text/javascript",
+                  "exec": [
+                    "if (pm.response.code === 201) {",
+                    "    const body = pm.response.json();",
+                    "    pm.collectionVariables.set('api_key_id_created', body.id);",
+                    "}"
+                  ]
+                }
+              }
+            ]
+          },
+          "response": []
+        },
+        {
+          "name": "Revoke API Key",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{jwt_admin}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/admin/api-keys/{{key_id_to_revoke}}",
+              "host": ["{{base_url}}"],
+              "path": ["admin", "api-keys", "{{key_id_to_revoke}}"]
+            },
+            "description": "Revokes a specific key, e.g. after a workstation is decommissioned. Swap {{key_id_to_revoke}} for {{api_key_id_created}} to revoke the key created above."
+          },
+          "response": []
+        },
+        {
+          "name": "Upsert Guardrail Policy Embeddings",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{jwt_admin}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/admin/organizations/{{org_id_created}}/policy-embeddings",
+              "host": ["{{base_url}}"],
+              "path": ["admin", "organizations", "{{org_id_created}}", "policy-embeddings"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"policy_profile\": \"govtech\",\n  \"topics\": [\n    \"partisan political campaigning\",\n    \"election propaganda\",\n    \"solicitation of bribery from a public office\"\n  ]\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "Org-specific embedding overrides for the Layer 2 (semantic) guardrail check, on top of the default govtech keyword blocklist."
+          },
+          "response": []
+        },
+        {
+          "name": "List Guardrail Policy Embeddings",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{jwt_admin}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/admin/organizations/{{org_id_created}}/policy-embeddings?policy_profile=govtech",
+              "host": ["{{base_url}}"],
+              "path": ["admin", "organizations", "{{org_id_created}}", "policy-embeddings"],
+              "query": [{ "key": "policy_profile", "value": "govtech" }]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Delete Guardrail Policy Embeddings",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{jwt_admin}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/admin/organizations/{{org_id_created}}/policy-embeddings/govtech",
+              "host": ["{{base_url}}"],
+              "path": ["admin", "organizations", "{{org_id_created}}", "policy-embeddings", "govtech"]
+            },
+            "description": "Reverts the org to the default in-process govtech embeddings for Layer 2 guardrails."
+          },
+          "response": []
+        },
+        {
+          "name": "Generate Monthly Report",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{jwt_admin}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/admin/reports/monthly?org_id={{org_id_created}}&year=2026&month=9",
+              "host": ["{{base_url}}"],
+              "path": ["admin", "reports", "monthly"],
+              "query": [
+                { "key": "org_id", "value": "{{org_id_created}}" },
+                { "key": "year", "value": "2026" },
+                { "key": "month", "value": "9" }
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Deactivate Organization (destructive)",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{jwt_admin}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/admin/organizations/{{org_id_created}}",
+              "host": ["{{base_url}}"],
+              "path": ["admin", "organizations", "{{org_id_created}}"]
+            },
+            "description": "Soft-deletes the org (is_active=false) and revokes every one of its API keys. Run this last if you're cleaning up after exercising the collection end-to-end."
+          },
+          "response": []
+        }
+      ]
+    }
+  ]
+}

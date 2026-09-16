@@ -132,10 +132,15 @@ async def pii_scan_request(request: Request) -> None:
     """
     start = time.monotonic()
 
-    industry_type = request.headers.get("X-Industry-Type", "")
+    claims = getattr(request.state, "jwt_claims", {})
+    # Sourced from the JWT claim (verified in auth_middleware to match the
+    # X-Industry-Type header), never the raw header directly — the header is
+    # client-controlled and picking the policy from it would let a caller
+    # request a weaker entity list than their token was actually issued for.
+    industry_type = claims.get("industry_type") or request.headers.get("X-Industry-Type", "")
     policy = get_policy(industry_type)
     request_id = getattr(request.state, "request_id", "")
-    org_id = getattr(request.state, "jwt_claims", {}).get("org_id", "unknown")
+    org_id = claims.get("org_id", "unknown")
 
     entities = policy.pii_entities if policy else [
         "PERSON", "EMAIL_ADDRESS", "PHONE_NUMBER", "US_SSN", "CREDIT_CARD",

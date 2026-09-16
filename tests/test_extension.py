@@ -30,7 +30,7 @@ def _no_pii():
 
 
 async def test_scan_clean_prompt_returns_clean(client):
-    token = make_jwt()
+    token = make_jwt(industry_type="govtech")
     with _no_pii():
         resp = await client.post(
             "/v1/extension/scan",
@@ -50,7 +50,7 @@ async def test_scan_clean_prompt_returns_clean(client):
 
 async def test_scan_masks_ph_identifiers(client):
     """A PhilSys number must be masked and rated high risk."""
-    token = make_jwt()
+    token = make_jwt(industry_type="govtech")
     prompt = "Please check the record for TIN 123-456-789-000"
 
     resp = await client.post(
@@ -89,7 +89,7 @@ async def test_scan_blocks_policy_violation_with_451(client):
 
 
 async def test_scan_blocks_prompt_injection(client):
-    token = make_jwt()
+    token = make_jwt(industry_type="govtech")
     with _no_pii():
         resp = await client.post(
             "/v1/extension/scan",
@@ -103,7 +103,7 @@ async def test_scan_blocks_prompt_injection(client):
 
 async def test_scan_fails_closed_on_presidio_error(client):
     """Any analyzer exception must block the send, never let it through."""
-    token = make_jwt()
+    token = make_jwt(industry_type="govtech")
     boom = MagicMock()
     boom.analyze.side_effect = RuntimeError("presidio exploded")
 
@@ -144,7 +144,7 @@ async def test_response_scan_never_returns_originals(client):
     The response-scan path reports what the page already showed. Returning
     original values there would widen exposure for no benefit.
     """
-    token = make_jwt()
+    token = make_jwt(industry_type="govtech")
     resp = await client.post(
         "/v1/extension/response-scan",
         json={"transaction_id": "tx_123", "text": "Contact them at someone@example.com"},
@@ -159,7 +159,7 @@ async def test_response_scan_never_returns_originals(client):
 
 async def test_policy_defaults_to_fail_closed(client):
     """fail_mode must never default to open — that would disable the product."""
-    token = make_jwt()
+    token = make_jwt(industry_type="govtech")
     resp = await client.get("/v1/extension/policy", headers=_auth(token, HEADERS_GOVTECH))
 
     assert resp.status_code == 200
@@ -167,7 +167,7 @@ async def test_policy_defaults_to_fail_closed(client):
 
 
 async def test_events_accepts_metadata_batch(client):
-    token = make_jwt()
+    token = make_jwt(industry_type="govtech")
     resp = await client.post(
         "/v1/extension/events",
         json={
@@ -188,7 +188,7 @@ async def test_events_rejects_smuggled_prompt_text(client):
     There is no field on the event model that can carry user text, so an event
     carrying one is rejected rather than quietly stored.
     """
-    token = make_jwt()
+    token = make_jwt(industry_type="govtech")
     resp = await client.post(
         "/v1/extension/events",
         json={
@@ -207,7 +207,7 @@ async def test_events_rejects_smuggled_prompt_text(client):
 
 
 async def test_heartbeat_ok(client):
-    token = make_jwt()
+    token = make_jwt(industry_type="govtech")
     resp = await client.post(
         "/v1/extension/heartbeat",
         json={"device_id": "dev_abc", "extension_version": "0.1.0"},

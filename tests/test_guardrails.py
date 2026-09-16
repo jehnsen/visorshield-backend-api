@@ -42,7 +42,7 @@ async def test_keyword_blocklist_healthcare(client):
 
 async def test_keyword_blocklist_fintech(client):
     """'guaranteed returns' triggers guardrail in fintech policy."""
-    token = make_jwt()
+    token = make_jwt(industry_type="fintech")
     payload = {
         "model": "gpt-4o-mini",
         "messages": [{"role": "user", "content": "This fund offers guaranteed returns of 20% annually."}],
@@ -65,7 +65,7 @@ async def test_keyword_blocklist_fintech(client):
 
 async def test_embedding_similarity_guardrail(client):
     """Semantically similar prohibited content triggers embedding guardrail."""
-    token = make_jwt()
+    token = make_jwt(industry_type="fintech")
     # "investment guarantees" is a prohibited topic for fintech
     payload = {
         "model": "gpt-4o-mini",
@@ -97,7 +97,7 @@ async def test_embedding_similarity_guardrail(client):
 
 async def test_guardrail_returns_451_not_403(client):
     """Guardrail violations must return 451, not 403 or 400."""
-    token = make_jwt()
+    token = make_jwt(industry_type="govtech")
     payload = {
         "model": "gpt-4o-mini",
         "messages": [
@@ -123,7 +123,7 @@ async def test_guardrail_returns_451_not_403(client):
 
 async def test_legal_hr_discriminatory_language(client):
     """Discriminatory hiring language triggers guardrail in legal_hr policy."""
-    token = make_jwt()
+    token = make_jwt(industry_type="legal_hr")
     payload = {
         "model": "gpt-4o-mini",
         "messages": [

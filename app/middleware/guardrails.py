@@ -226,10 +226,14 @@ async def guardrails_middleware(request: Request) -> None:
     """
     start = time.monotonic()
 
-    industry_type = request.headers.get("X-Industry-Type", "")
+    claims = getattr(request.state, "jwt_claims", {})
+    # Sourced from the JWT claim (verified in auth_middleware to match the
+    # X-Industry-Type header), never the raw header directly — see the same
+    # note in pii_engine.py::pii_scan_request.
+    industry_type = claims.get("industry_type") or request.headers.get("X-Industry-Type", "")
     policy = get_policy(industry_type)
     request_id = getattr(request.state, "request_id", "")
-    org_id = getattr(request.state, "jwt_claims", {}).get("org_id", "unknown")
+    org_id = claims.get("org_id", "unknown")
 
     if not policy:
         # Should be unreachable: the proxy rejects unknown X-Industry-Type at the

@@ -33,6 +33,11 @@ class Settings(BaseSettings):
     WEBHOOK_MIN_SEVERITY: str = "all"
     LOG_LEVEL: str = "INFO"
     ENVIRONMENT: Literal["development", "staging", "production"] = "development"
+    # Secure by default: if the DB is unreachable during the auth org/key-active
+    # check, the request is BLOCKED rather than silently let through. Flipping
+    # this to True is a deliberate availability-over-security trade-off for
+    # non-production environments only — see validate_production_readiness.
+    AUTH_FAIL_OPEN_ON_DB_ERROR: bool = False
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
@@ -48,6 +53,8 @@ class Settings(BaseSettings):
                 errors.append("At least one of OPENAI_API_KEY or ANTHROPIC_API_KEY must be set")
             if self.WEBHOOK_URL and not self.WEBHOOK_SECRET:
                 errors.append("WEBHOOK_SECRET must be set when WEBHOOK_URL is configured")
+            if self.AUTH_FAIL_OPEN_ON_DB_ERROR:
+                errors.append("AUTH_FAIL_OPEN_ON_DB_ERROR must not be enabled in production")
             if errors:
                 raise ValueError("Production configuration errors:\n" + "\n".join(f"  - {e}" for e in errors))
         return self
