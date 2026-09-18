@@ -182,6 +182,18 @@ Expected response:
 }
 ```
 
+### 6. Seed demo data (optional)
+
+`docs/VisorShield.postman_collection.json` signs its JWTs against a fixed org and set of API-key ids baked into its collection variables. Those rows have to actually exist — the auth org/key-active check is fail-closed (see `CLAUDE.md` → Failure Modes), so an unseeded database rejects every collection request with `401 organization_not_found`. Seed them with:
+
+```bash
+docker-compose --profile seed up seed
+```
+
+This runs `python -m app.db.seed` via a one-shot container gated behind the `seed` Compose profile, so it never runs on a plain `docker-compose up`. Running it locally instead of via Compose: `python -m app.db.seed` with `DATABASE_URL` pointed at your instance.
+
+Beyond the collection's own org, it also seeds four Philippine-context demo tenants — one per industry profile (a govtech LGU-services BPO, a healthcare teleconsult provider, a rural bank's collections desk, and an HR/legal advisory firm) — each with departments, groups, users, a handful of transactions (including a guardrail-blocked one), and, for the govtech tenant, custom Layer-3 pgvector guardrail topics. Organizations/departments/groups/users are upserted (safe to re-run); transactions and guardrail incidents are append-only like the rest of the audit log, so re-running adds another batch rather than deduplicating.
+
 ---
 
 ## Generating a JWT for Testing

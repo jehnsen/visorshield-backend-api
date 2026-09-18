@@ -75,6 +75,7 @@ visorshield/
 │   │   └── webhook_service.py   # HMAC-signed guardrail-incident webhook delivery
 │   ├── db/
 │   │   ├── database.py          # SQLAlchemy async engine + session factory
+│   │   ├── seed.py              # Idempotent demo data: fixed org + API keys the Postman collection expects
 │   │   └── migrations/
 │   │       └── 001_initial.sql  # Legacy schema snapshot — alembic/versions/ is authoritative
 │   └── policies/
@@ -622,6 +623,11 @@ pytest tests/ -v --tb=short
 1. `POST /admin/organizations/{org_id}/policy-embeddings` with `policy_profile` + `topics: [...]` — this embeds and upserts each topic into `policy_embeddings` and invalidates the presence cache immediately
 2. `GET .../policy-embeddings` to list what's stored; `DELETE .../policy-embeddings/{policy_profile}` to clear a profile back to the default topic set
 3. No migration needed — this is data, not schema
+
+**Write a new migration:**
+1. New Alembic revision under `alembic/versions/`, `down_revision` = current head — never edit an already-applied migration
+2. Update `app/db/migrations/001_initial.sql` to match the new head — it's a consolidated snapshot equivalent to `alembic upgrade head`, not just migration 0001, and CLAUDE.md's own Project Structure/Quick Start docs assume it stays in sync
+3. If the migration touches `organizations` or `api_keys` shape (columns, constraints), check `app/db/seed.py` still inserts valid rows — it's a raw-SQL upsert, not ORM, so it won't fail loudly on a shape mismatch the way an ORM insert would
 
 ---
 

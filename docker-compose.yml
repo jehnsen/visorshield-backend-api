@@ -19,6 +19,29 @@ services:
       - visorshield-net
     restart: "no"
 
+  seed:
+    # Opt-in demo/dev data — the fixed org + API keys that
+    # docs/VisorShield.postman_collection.json references by exact UUID (see
+    # app/db/seed.py). Never runs on a plain `docker-compose up`; run
+    # explicitly with `docker-compose --profile seed up seed`.
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: visorshield-seed
+    command: ["python", "-m", "app.db.seed"]
+    profiles: ["seed"]
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://visorshield:visorshield@postgres:5432/visorshield
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - visorshield-net
+    restart: "no"
+
   visorshield-api:
     build:
       context: .
