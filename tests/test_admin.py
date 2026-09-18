@@ -93,6 +93,7 @@ async def test_quota_exceeded_response_format(client, valid_token, fake_redis):
             headers={
                 "Authorization": f"Bearer {valid_token}",
                 "X-Industry-Type": "healthcare",
+                "X-VisorShield-User": "test-user-1",
             },
         )
 
@@ -116,7 +117,11 @@ async def test_revoked_api_key_is_rejected(client):
         resp = await client.post(
             "/v1/chat/completions",
             json={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]},
-            headers={"Authorization": f"Bearer {token}", "X-Industry-Type": "healthcare"},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "X-Industry-Type": "healthcare",
+                "X-VisorShield-User": "test-user-1",
+            },
         )
 
     assert resp.status_code == 401
@@ -134,7 +139,11 @@ async def test_deactivated_org_is_rejected(client):
         resp = await client.post(
             "/v1/chat/completions",
             json={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]},
-            headers={"Authorization": f"Bearer {token}", "X-Industry-Type": "healthcare"},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "X-Industry-Type": "healthcare",
+                "X-VisorShield-User": "test-user-1",
+            },
         )
 
     assert resp.status_code == 403

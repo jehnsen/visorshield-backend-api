@@ -1,5 +1,5 @@
 import uuid
-from sqlalchemy import Column, String, Integer, BigInteger, Boolean, Numeric, TIMESTAMP, Text, ForeignKey, func
+from sqlalchemy import Column, String, Integer, BigInteger, Boolean, Numeric, TIMESTAMP, Text, ForeignKey, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import UUID, JSONB, ARRAY
 from sqlalchemy.orm import relationship
 from app.db.database import Base
@@ -54,9 +54,26 @@ class Transaction(Base):
     latency_ms = Column(Integer)
     industry_type = Column(String(50))
     routing_reason = Column(String(100))
-    created_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
+    # Resolved User row for the caller (see app/models/identity.py). Nullable:
+    # identity resolution is best-effort/fail-open, so a DB hiccup there must
+    # never block or fail-close the audit write itself.
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    # Raw X-VisorShield-User value, kept even if user_id resolution failed —
+    # "who made this call" must survive an identity-service outage.
+    external_user_id = Column(String(255), nullable=True)
+    # Tamper-evident hash chain (see app/services/audit_integrity.py). Set by
+    # the application at write time, never by the DB, so the hash can commit
+    # to created_at deterministically before the row exists.
+    chain_seq = Column(BigInteger, nullable=False)
+    prev_hash = Column(String(64), nullable=True)
+    record_hash = Column(String(64), nullable=False)
+    # Application-generated (not server_default) so it can be included in the
+    # hash committed to record_hash before the row is inserted.
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False)
 
     organization = relationship("Organization", back_populates="transactions")
+
+    __table_args__ = (UniqueConstraint("org_id", "chain_seq", name="uq_transaction_org_chain_seq"),)
 
 
 class GuardrailIncident(Base):
@@ -71,3 +88,18 @@ class GuardrailIncident(Base):
     detection_layer = Column(String(20))
     prompt_hash = Column(String(64))
     created_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
+
+
+class AuditChainState(Base):
+    """
+    One row per org: the tip of that org's transactions hash chain. Locked via
+    ``SELECT ... FOR UPDATE`` when appending (see audit_integrity.py) so
+    concurrent fire-and-forget audit writes for the same org serialize instead
+    of racing on prev_hash, which would silently fork the chain.
+    """
+    __tablename__ = "audit_chain_state"
+
+    org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), primary_key=True)
+    last_seq = Column(BigInteger, nullable=False, default=0)
+    last_hash = Column(String(64), nullable=True)
+    updated_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)

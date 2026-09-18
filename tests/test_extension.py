@@ -13,8 +13,8 @@ from tests.conftest import make_jwt
 
 pytestmark = pytest.mark.asyncio
 
-HEADERS_GOVTECH = {"X-Industry-Type": "govtech", "X-Org-ID": "test-org-123"}
-HEADERS_HEALTHCARE = {"X-Industry-Type": "healthcare", "X-Org-ID": "test-org-123"}
+HEADERS_GOVTECH = {"X-Industry-Type": "govtech", "X-Org-ID": "test-org-123", "X-VisorShield-User": "test-user-1"}
+HEADERS_HEALTHCARE = {"X-Industry-Type": "healthcare", "X-Org-ID": "test-org-123", "X-VisorShield-User": "test-user-1"}
 
 
 def _auth(token: str, headers: dict) -> dict:

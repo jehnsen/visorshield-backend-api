@@ -99,6 +99,7 @@ class TestFailClosed:
                     headers={
                         "Authorization": f"Bearer {token}",
                         "X-Industry-Type": "healthcare",
+                        "X-VisorShield-User": "test-user-1",
                     },
                 )
 

@@ -79,11 +79,19 @@ def patch_redis(fake_redis):
 
 @pytest.fixture(autouse=True)
 def patch_db():
-    with patch("app.services.audit_service.AsyncSessionLocal") as mock_session_factory:
-        mock_session = AsyncMock()
-        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session.__aexit__ = AsyncMock(return_value=False)
-        mock_session_factory.return_value = mock_session
+    mock_session = AsyncMock()
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=False)
+
+    # Every module that opens its own AsyncSessionLocal() for fire-and-forget
+    # writes (audit rows, identity/inventory auto-discovery upserts) needs the
+    # same mock, or it falls through to a real DB connection attempt.
+    with patch("app.services.audit_service.AsyncSessionLocal") as audit_factory, \
+         patch("app.services.identity_service.AsyncSessionLocal") as identity_factory, \
+         patch("app.services.inventory_service.AsyncSessionLocal") as inventory_factory:
+        audit_factory.return_value = mock_session
+        identity_factory.return_value = mock_session
+        inventory_factory.return_value = mock_session
         yield mock_session
 
 

@@ -10,6 +10,8 @@ from app.config import settings
 # Ensure all model modules are imported so their tables are in Base.metadata
 import app.models.audit       # noqa: F401
 import app.models.embeddings  # noqa: F401
+import app.models.identity    # noqa: F401
+import app.models.inventory   # noqa: F401
 
 config = context.config
 if config.config_file_name is not None:

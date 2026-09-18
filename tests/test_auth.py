@@ -7,7 +7,7 @@ from app.config import settings
 pytestmark = pytest.mark.asyncio
 
 BASIC_PAYLOAD = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}
-HEADERS = {"X-Industry-Type": "healthcare"}
+HEADERS = {"X-Industry-Type": "healthcare", "X-VisorShield-User": "test-user-1"}
 
 
 async def test_valid_jwt_passes(client, valid_token):

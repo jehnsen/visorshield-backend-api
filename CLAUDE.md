@@ -26,6 +26,7 @@ Think of it as a Zero-Trust API Gateway, but specifically designed for AI worklo
 | Embeddings (Guardrails) | sentence-transformers paraphrase-MiniLM-L6-v2 |
 | Auth | PyJWT (HS256) |
 | Logging | structlog (JSON structured output) |
+| Metrics | prometheus-client (`GET /metrics`) |
 | Containerization | Docker + Docker Compose |
 | Testing | pytest + pytest-asyncio + httpx + fakeredis |
 
@@ -52,17 +53,22 @@ visorshield/
 │   ├── models/
 │   │   ├── request.py           # Pydantic input models
 │   │   ├── response.py          # Pydantic output models
-│   │   ├── audit.py             # SQLAlchemy ORM models
+│   │   ├── audit.py             # SQLAlchemy ORM models (transactions, incidents, chain state)
+│   │   ├── identity.py          # Department, Group, User, UserGroupMembership
+│   │   ├── inventory.py         # AIProvider, AIModel, AIApp, BrowserInstallation
 │   │   └── policy.py            # Policy profile enums and config
 │   ├── services/
 │   │   ├── llm_router.py        # Provider routing + cost-based model selection
-│   │   ├── audit_service.py     # Async audit log writer
+│   │   ├── audit_service.py     # Async audit log writer (hash-chains every write)
+│   │   ├── audit_integrity.py   # Hash-chain canonicalization/append/verify
+│   │   ├── identity_service.py  # X-VisorShield-User -> User row (get-or-create)
+│   │   ├── inventory_service.py # Auto-discovers providers/models/apps/devices
 │   │   ├── cost_calculator.py   # Real-time token cost computation
 │   │   └── report_service.py    # Monthly usage summary generator
 │   ├── db/
 │   │   ├── database.py          # SQLAlchemy async engine + session factory
 │   │   └── migrations/
-│   │       └── 001_initial.sql  # Full schema (run once on fresh DB)
+│   │       └── 001_initial.sql  # Legacy schema snapshot — alembic/versions/ is authoritative
 │   └── policies/
 │       ├── healthcare.py        # HIPAA/DPA template: recognizers + blocklist
 │       ├── fintech.py           # PCI-DSS template: recognizers + blocklist
@@ -128,6 +134,8 @@ Client Response
 | Auth failure | Block. Return error. | 401 / 403 |
 | X-Industry-Type / JWT industry_type mismatch | Block. Never silently pick either value. | 403 |
 | Auth DB unreachable (org/key active check) | **Fail-closed. Block request.** (see `AUTH_FAIL_OPEN_ON_DB_ERROR`) | 503 |
+| Missing X-VisorShield-User header | Block — required, see Identity Model. | 422 |
+| Identity resolution (User upsert) DB error | **Fail-open.** Enrichment, not a security gate — proceeds with `user_id: None`. | n/a |
 | Rate limit exceeded | Block. Return reset_date. | 429 |
 | PII scan exception | **Fail-closed. Block request.** | 500 |
 | Guardrails hit | Block. Log incident. Never forward to LLM. | 451 |
@@ -258,7 +266,111 @@ Update this table when provider pricing changes. This is the single source of tr
 | `Authorization` | Yes | `Bearer <jwt>` |
 | `X-Industry-Type` | Yes | `healthcare / fintech / govtech / legal_hr` |
 | `X-Org-ID` | Yes | Organization UUID |
+| `X-VisorShield-User` | Yes | Caller identity (SSO subject / email / employee ID) — see Identity Model below |
 | `Content-Type` | Yes | `application/json` |
+
+---
+
+## Identity Model
+
+Tenancy used to stop at organizations + api_keys — every call under a shared
+app/API key was indistinguishable, so "who is using which AI service" was
+unanswerable. `X-VisorShield-User` closes that: `auth_middleware` resolves it
+into a `User` row (`app/models/identity.py`), auto-provisioned on first sight
+via `identity_service.get_or_create_user`.
+
+- **`departments`** / **`groups`** — org-scoped groupings an admin curates via
+  `/admin/departments` and `/admin/groups`. `groups` is cross-cutting
+  (many-to-many via `user_group_memberships`); `department_id` is a single
+  FK on `users`.
+- **`users`** — one row per `(org_id, external_id)`, auto-provisioned, never
+  hand-created. `external_id` is whatever the calling app already uses
+  (SSO subject, email, employee ID) — VisorShield does not authenticate it,
+  only tracks it. Curate via `PATCH /admin/users/{id}` (department, email,
+  display name, active flag).
+- **Resolution is fail-open, not fail-closed**: identity is an FinOps/policy
+  enrichment, not a security gate — a DB hiccup here degrades to
+  `user_id: None` (with `external_user_id` still recorded) rather than
+  blocking the request. The org/API-key active check stays the actual gate
+  and stays fail-closed (see Failure Modes).
+- Every `Transaction` carries both `user_id` (nullable FK) and
+  `external_user_id` (the raw header, always recorded) — `GET
+  /audit/usage-by-user` is the "who is using AI" rollup.
+
+---
+
+## AI Inventory
+
+There were no tables for providers, models, calling apps, or browser
+installations — a governance proxy with nothing to show for what it's
+actually governing. `app/models/inventory.py` holds four tables, all
+**auto-discovered from observed traffic** (`app/services/inventory_service.py`),
+not hand-entered:
+
+| Table | Upserted from | Meaning |
+|---|---|---|
+| `ai_providers` / `ai_models` | Every completed transaction's `(provider, model_used)` | Catalog of what's actually been called. **Not** a pricing source — `cost_calculator.py` remains the only source of truth for pricing (see LLM Cost Routing Rules); `is_sanctioned` is a governance flag only. |
+| `ai_apps` | Every transaction's `app_source` | Calling applications — the "shadow AI" surface. Toggle `is_sanctioned` via `PATCH /admin/inventory/apps/{id}`. |
+| `browser_installations` | `POST /v1/extension/heartbeat` | One row per `device_id`, linked to `user_id` when resolved. |
+
+List/sanction via `GET/PATCH /admin/inventory/{providers,models,apps,devices}`.
+
+---
+
+## Prometheus Metrics
+
+`GET /metrics` (unauthenticated, like `/health` — scope access at the network
+layer) exposes Prometheus exposition text via `app/services/metrics.py`. For a
+governance product, "how many requests did we block, by policy, by org" is
+the demo — the counters below are derived from data the pipeline already
+produces (`request.state.pipeline_timing`, `GuardrailIncident` rows), not a
+separate metrics pipeline:
+
+| Metric | Type | Labels | Source |
+|---|---|---|---|
+| `visorshield_requests_total` | Counter | `org_id`, `industry_type`, `outcome` (`pass` / `blocked` / `upstream_error`) | `record_outcome()` — one call per request in `app/routers/proxy.py` |
+| `visorshield_requests_blocked_total` | Counter | `org_id`, `industry_type`, `pipeline_step`, `reason` | `record_blocked()` in `_run_pipeline()` — catches every `HTTPException` from any of the 4 pre-LLM steps, not just guardrail 451s |
+| `visorshield_guardrail_incidents_total` | Counter | `org_id`, `policy_profile`, `detection_layer`, `violation_category` | `record_guardrail_incident()` in `audit_service.log_guardrail_incident()` — mirrors `GuardrailIncident` rows, so this metric and `GET /audit/incidents` never disagree |
+| `visorshield_pipeline_step_duration_ms` | Histogram | `pipeline_step` | `record_pipeline_timing()` — flushes `request.state.pipeline_timing` on every request (pass or block) |
+
+`_run_pipeline()` in `proxy.py` is the single instrumentation point for
+blocks — it wraps each of the 4 pipeline steps and records org/policy/step/
+reason from the `HTTPException` it catches before re-raising it unchanged.
+Add a new pipeline step to `_PIPELINE_STEPS` there, not a new try/except
+elsewhere, so it's covered automatically.
+
+---
+
+## Audit Integrity
+
+"Immutable audit" used to mean plain Postgres rows any admin (or anyone with
+DB creds) could `UPDATE` with no trace. Two mechanisms now back that claim:
+
+1. **Hash chain** (`app/services/audit_integrity.py`) — every `Transaction`
+   commits to `record_hash = sha256(prev_hash || canonical_fields)`, chained
+   per-org via the `audit_chain_state` anchor row (locked with `SELECT ...
+   FOR UPDATE` on append, so concurrent fire-and-forget writes for the same
+   org can't race and fork the chain). Editing a row after the fact breaks
+   its own hash and every later link. `GET /audit/verify?org_id=...`
+   recomputes the chain and reports the first broken link, if any.
+2. **Append-only enforcement** — a `BEFORE UPDATE OR DELETE` trigger
+   (`prevent_audit_mutation()`, migration 0003) rejects mutation of
+   `transactions` and `guardrail_incidents` outright, at the DB engine level,
+   regardless of which role issues the statement.
+
+**Accepted boundary**: this does not survive a superuser dropping the trigger
+and hand-editing prior links to match — the same boundary standard Postgres
+audit-trigger extensions operate under. What it closes is routine admin
+access or a compromised app credential quietly editing history.
+
+`created_at` on `Transaction` is **application-generated**, not a DB
+`server_default` — it must be committed to the hash before the row exists,
+so the app always sets it explicitly (see `audit_service.log_transaction`).
+
+**Export**: `GET /audit/export?format=csv|json` streams a bulk download
+(capped at 50,000 rows per call; page with `date_from` beyond that) including
+the hash-chain fields, so an exported file can be independently re-verified
+offline.
 
 ---
 
@@ -344,6 +456,12 @@ pytest tests/ -v --tb=short
 2. Add pricing entries in `app/services/cost_calculator.py`
 3. Add provider name to the `Provider` enum in `app/models/policy.py`
 
+**Add a field to the audit record:**
+1. Add the column to `Transaction` in `app/models/audit.py`
+2. Add it to `canonical_transaction_fields(...)` in `app/services/audit_integrity.py` — it must be in the hash, or it's mutable without detection
+3. Write an alembic migration (new revision, `down_revision` = current head) — never edit an already-applied migration
+4. Thread it through `log_transaction(...)` call sites and `_tx_export_row` in `app/routers/audit.py`
+
 ---
 
 ## What NOT To Do
@@ -357,3 +475,6 @@ pytest tests/ -v --tb=short
 - **Never log PII values** — log entity types only (e.g., `"PERSON"` not `"Juan dela Cruz"`).
 - **Never select a policy profile from the raw `X-Industry-Type` header.** Only use it after `auth.py` has confirmed it matches the JWT's `industry_type` claim; downstream steps (`pii_engine.py`, `guardrails.py`) read `request.state.jwt_claims["industry_type"]`, not the header.
 - **Never fall back to JWT-only org limits when the DB fetch in `auth.py` succeeds.** The DB row is authoritative for `allowed_models`, `requests_per_second`, and `monthly_token_budget`; the JWT values are only a fallback for when the DB check itself is skipped or explicitly fails open.
+- **Never UPDATE or DELETE rows in `transactions` or `guardrail_incidents`.** The append-only trigger (`prevent_audit_mutation()`) rejects it at the DB level; if you need to fix bad data, insert a correction row, don't edit history.
+- **Never add a field to `Transaction` without adding it to `canonical_transaction_fields(...)` in `audit_integrity.py`.** A column outside the hash is a column that can be silently edited without `/audit/verify` ever noticing.
+- **Never make `X-VisorShield-User` optional or best-effort at the header level.** Identity *resolution* (the DB upsert) is allowed to fail open — see Failure Modes — but the header itself is required, same as `X-Industry-Type`.

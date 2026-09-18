@@ -14,8 +14,8 @@ _CLEAN_PAYLOAD = {
     "messages": [{"role": "user", "content": "What is the capital of France?"}],
 }
 
-_GOVTECH_HEADERS = {"X-Industry-Type": "govtech", "X-Org-ID": "test-org-123"}
-_HEALTHCARE_HEADERS = {"X-Industry-Type": "healthcare", "X-Org-ID": "test-org-123"}
+_GOVTECH_HEADERS = {"X-Industry-Type": "govtech", "X-Org-ID": "test-org-123", "X-VisorShield-User": "test-user-1"}
+_HEALTHCARE_HEADERS = {"X-Industry-Type": "healthcare", "X-Org-ID": "test-org-123", "X-VisorShield-User": "test-user-1"}
 
 
 def _patched_pii():

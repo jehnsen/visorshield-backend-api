@@ -12,6 +12,8 @@ from app.db.database import get_db
 from app.dependencies import require_admin
 from app.models.audit import Organization, APIKey, Transaction
 from app.models.embeddings import PolicyEmbedding
+from app.models.identity import Department, Group, User, UserGroupMembership
+from app.models.inventory import AIProvider, AIModel, AIApp, BrowserInstallation
 from app.services.report_service import generate_monthly_summary
 from app.middleware.guardrails import invalidate_embedding_cache
 
@@ -45,6 +47,27 @@ class CreateAPIKeyRequest(BaseModel):
 class UpsertEmbeddingsRequest(BaseModel):
     policy_profile: str
     topics: List[str]
+
+
+class CreateDepartmentRequest(BaseModel):
+    org_id: str
+    name: str
+
+
+class CreateGroupRequest(BaseModel):
+    org_id: str
+    name: str
+
+
+class UpdateUserRequest(BaseModel):
+    department_id: Optional[str] = None
+    email: Optional[str] = None
+    display_name: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+class SetSanctionRequest(BaseModel):
+    is_sanctioned: bool
 
 
 @router.post("/organizations", status_code=201)
@@ -401,3 +424,295 @@ async def monthly_report(
 ):
     summary = await generate_monthly_summary(db, org_id=org_id, year=year, month=month)
     return summary
+
+
+# ── Identity: departments, groups, users ───────────────────────────────────
+# Users themselves are auto-provisioned from X-VisorShield-User (see
+# app/services/identity_service.py) — these endpoints are for curating them
+# (assigning a department/groups) and for the "who is using AI" rollup that
+# was previously unanswerable.
+
+@router.post("/departments", status_code=201)
+async def create_department(
+    body: CreateDepartmentRequest,
+    db: AsyncSession = Depends(get_db),
+    _claims: dict = Depends(require_admin()),
+):
+    dept = Department(org_id=uuid.UUID(body.org_id), name=body.name)
+    db.add(dept)
+    await db.flush()
+    await db.refresh(dept)
+    return {"id": str(dept.id), "org_id": str(dept.org_id), "name": dept.name}
+
+
+@router.get("/departments")
+async def list_departments(
+    org_id: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+    _claims: dict = Depends(require_admin()),
+):
+    result = await db.execute(select(Department).where(Department.org_id == uuid.UUID(org_id)))
+    return {"items": [{"id": str(d.id), "org_id": str(d.org_id), "name": d.name} for d in result.scalars().all()]}
+
+
+@router.post("/groups", status_code=201)
+async def create_group(
+    body: CreateGroupRequest,
+    db: AsyncSession = Depends(get_db),
+    _claims: dict = Depends(require_admin()),
+):
+    group = Group(org_id=uuid.UUID(body.org_id), name=body.name)
+    db.add(group)
+    await db.flush()
+    await db.refresh(group)
+    return {"id": str(group.id), "org_id": str(group.org_id), "name": group.name}
+
+
+@router.get("/groups")
+async def list_groups(
+    org_id: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+    _claims: dict = Depends(require_admin()),
+):
+    result = await db.execute(select(Group).where(Group.org_id == uuid.UUID(org_id)))
+    return {"items": [{"id": str(g.id), "org_id": str(g.org_id), "name": g.name} for g in result.scalars().all()]}
+
+
+@router.post("/groups/{group_id}/members/{user_id}", status_code=201)
+async def add_group_member(
+    group_id: str,
+    user_id: str,
+    db: AsyncSession = Depends(get_db),
+    _claims: dict = Depends(require_admin()),
+):
+    group_uuid, user_uuid = uuid.UUID(group_id), uuid.UUID(user_id)
+    existing = await db.execute(
+        select(UserGroupMembership).where(
+            and_(UserGroupMembership.group_id == group_uuid, UserGroupMembership.user_id == user_uuid)
+        )
+    )
+    if existing.scalar_one_or_none() is None:
+        db.add(UserGroupMembership(group_id=group_uuid, user_id=user_uuid))
+        await db.flush()
+    return {"group_id": group_id, "user_id": user_id}
+
+
+@router.get("/users")
+async def list_users(
+    org_id: str = Query(...),
+    department_id: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+    _claims: dict = Depends(require_admin()),
+):
+    """
+    The rollup that answers "who is using AI here" — every caller identity
+    auto-provisioned from X-VisorShield-User, with whatever department an
+    admin has assigned so far.
+    """
+    filters = [User.org_id == uuid.UUID(org_id)]
+    if department_id:
+        filters.append(User.department_id == uuid.UUID(department_id))
+
+    total = (await db.execute(select(func.count(User.id)).where(and_(*filters)))).scalar()
+    result = await db.execute(
+        select(User)
+        .where(and_(*filters))
+        .order_by(User.last_seen_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
+    users = result.scalars().all()
+    return {
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "items": [
+            {
+                "id": str(u.id),
+                "org_id": str(u.org_id),
+                "external_id": u.external_id,
+                "email": u.email,
+                "display_name": u.display_name,
+                "department_id": str(u.department_id) if u.department_id else None,
+                "is_active": u.is_active,
+                "first_seen_at": u.first_seen_at.isoformat() if u.first_seen_at else None,
+                "last_seen_at": u.last_seen_at.isoformat() if u.last_seen_at else None,
+            }
+            for u in users
+        ],
+    }
+
+
+@router.patch("/users/{user_id}")
+async def update_user(
+    user_id: str,
+    body: UpdateUserRequest,
+    db: AsyncSession = Depends(get_db),
+    claims: dict = Depends(require_admin()),
+):
+    result = await db.execute(select(User).where(User.id == uuid.UUID(user_id)))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail={"error": "user_not_found"})
+
+    changed = {}
+    if body.department_id is not None:
+        user.department_id = uuid.UUID(body.department_id) if body.department_id else None
+        changed["department_id"] = body.department_id
+    if body.email is not None:
+        user.email = body.email
+        changed["email"] = body.email
+    if body.display_name is not None:
+        user.display_name = body.display_name
+        changed["display_name"] = body.display_name
+    if body.is_active is not None:
+        user.is_active = body.is_active
+        changed["is_active"] = body.is_active
+
+    await db.flush()
+    log.info("admin_user_updated", user_id=user_id, changed=list(changed.keys()),
+              admin=claims.get("sub"), pipeline_step="admin")
+    return {"id": user_id, "updated": changed}
+
+
+# ── AI inventory: providers, models, apps, browser installations ──────────
+# Rows here are auto-discovered from observed traffic (see
+# app/services/inventory_service.py) — these endpoints list and sanction
+# what's been found, they don't hand-enter the catalog.
+
+@router.get("/inventory/providers")
+async def list_providers(
+    db: AsyncSession = Depends(get_db),
+    _claims: dict = Depends(require_admin()),
+):
+    result = await db.execute(select(AIProvider).order_by(AIProvider.name))
+    return {
+        "items": [
+            {"id": str(p.id), "name": p.name, "last_seen_at": p.last_seen_at.isoformat() if p.last_seen_at else None}
+            for p in result.scalars().all()
+        ]
+    }
+
+
+@router.get("/inventory/models")
+async def list_models(
+    provider_id: Optional[str] = Query(None),
+    is_sanctioned: Optional[bool] = Query(None),
+    db: AsyncSession = Depends(get_db),
+    _claims: dict = Depends(require_admin()),
+):
+    filters = []
+    if provider_id:
+        filters.append(AIModel.provider_id == uuid.UUID(provider_id))
+    if is_sanctioned is not None:
+        filters.append(AIModel.is_sanctioned == is_sanctioned)
+
+    q = select(AIModel).order_by(AIModel.name)
+    if filters:
+        q = q.where(and_(*filters))
+    result = await db.execute(q)
+    return {
+        "items": [
+            {
+                "id": str(m.id),
+                "provider_id": str(m.provider_id),
+                "name": m.name,
+                "is_sanctioned": m.is_sanctioned,
+                "first_seen_at": m.first_seen_at.isoformat() if m.first_seen_at else None,
+                "last_seen_at": m.last_seen_at.isoformat() if m.last_seen_at else None,
+            }
+            for m in result.scalars().all()
+        ]
+    }
+
+
+@router.patch("/inventory/models/{model_id}")
+async def set_model_sanctioned(
+    model_id: str,
+    body: SetSanctionRequest,
+    db: AsyncSession = Depends(get_db),
+    claims: dict = Depends(require_admin()),
+):
+    result = await db.execute(select(AIModel).where(AIModel.id == uuid.UUID(model_id)))
+    model = result.scalar_one_or_none()
+    if not model:
+        raise HTTPException(status_code=404, detail={"error": "model_not_found"})
+    model.is_sanctioned = body.is_sanctioned
+    await db.flush()
+    log.warning("admin_model_sanction_changed", model_id=model_id, is_sanctioned=body.is_sanctioned,
+                admin=claims.get("sub"), pipeline_step="admin")
+    return {"id": model_id, "is_sanctioned": body.is_sanctioned}
+
+
+@router.get("/inventory/apps")
+async def list_apps(
+    org_id: str = Query(...),
+    is_sanctioned: Optional[bool] = Query(None),
+    db: AsyncSession = Depends(get_db),
+    _claims: dict = Depends(require_admin()),
+):
+    filters = [AIApp.org_id == uuid.UUID(org_id)]
+    if is_sanctioned is not None:
+        filters.append(AIApp.is_sanctioned == is_sanctioned)
+    result = await db.execute(select(AIApp).where(and_(*filters)).order_by(AIApp.app_source))
+    return {
+        "items": [
+            {
+                "id": str(a.id),
+                "org_id": str(a.org_id),
+                "app_source": a.app_source,
+                "category": a.category,
+                "is_sanctioned": a.is_sanctioned,
+                "first_seen_at": a.first_seen_at.isoformat() if a.first_seen_at else None,
+                "last_seen_at": a.last_seen_at.isoformat() if a.last_seen_at else None,
+            }
+            for a in result.scalars().all()
+        ]
+    }
+
+
+@router.patch("/inventory/apps/{app_id}")
+async def set_app_sanctioned(
+    app_id: str,
+    body: SetSanctionRequest,
+    db: AsyncSession = Depends(get_db),
+    claims: dict = Depends(require_admin()),
+):
+    """Flip an app's sanctioned status — the "shadow AI" control surface."""
+    result = await db.execute(select(AIApp).where(AIApp.id == uuid.UUID(app_id)))
+    app = result.scalar_one_or_none()
+    if not app:
+        raise HTTPException(status_code=404, detail={"error": "app_not_found"})
+    app.is_sanctioned = body.is_sanctioned
+    await db.flush()
+    log.warning("admin_app_sanction_changed", app_id=app_id, is_sanctioned=body.is_sanctioned,
+                admin=claims.get("sub"), pipeline_step="admin")
+    return {"id": app_id, "is_sanctioned": body.is_sanctioned}
+
+
+@router.get("/inventory/devices")
+async def list_devices(
+    org_id: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+    _claims: dict = Depends(require_admin()),
+):
+    result = await db.execute(
+        select(BrowserInstallation).where(BrowserInstallation.org_id == uuid.UUID(org_id))
+        .order_by(BrowserInstallation.last_seen_at.desc())
+    )
+    return {
+        "items": [
+            {
+                "id": str(d.id),
+                "org_id": str(d.org_id),
+                "device_id": d.device_id,
+                "user_id": str(d.user_id) if d.user_id else None,
+                "extension_version": d.extension_version,
+                "first_seen_at": d.first_seen_at.isoformat() if d.first_seen_at else None,
+                "last_seen_at": d.last_seen_at.isoformat() if d.last_seen_at else None,
+            }
+            for d in result.scalars().all()
+        ]
+    }

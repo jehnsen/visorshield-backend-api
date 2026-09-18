@@ -15,6 +15,7 @@ from app.middleware.response_scanner import scan_response
 from app.services.llm_router import route_request, stream_request
 from app.services.audit_service import log_transaction, log_guardrail_incident, fire_and_forget_audit
 from app.services.cost_calculator import calculate_cost
+from app.services.metrics import record_blocked, record_outcome, record_pipeline_timing
 from app.policies import VALID_INDUSTRY_TYPES
 from app.config import settings
 
@@ -44,14 +45,55 @@ def _require_valid_industry_type(request: Request) -> str:
     return industry_type
 
 
+_PIPELINE_STEPS = [
+    ("auth", auth_middleware),
+    ("rate_limit", rate_limit_middleware),
+    ("pii_engine", pii_scan_request),
+    ("guardrails", guardrails_middleware),
+]
+
+
+def _block_reason(exc: HTTPException) -> str:
+    detail = exc.detail
+    return detail.get("error", "unknown") if isinstance(detail, dict) else str(detail)
+
+
 async def _run_pipeline(request: Request, body: ChatCompletionRequest) -> None:
-    """Execute the 4-step pre-LLM interceptor pipeline in order."""
+    """
+    Execute the 4-step pre-LLM interceptor pipeline in order.
+
+    Every HTTPException raised by a step is a governance block — recorded here
+    (org, industry policy profile, which step, why) rather than at each
+    middleware's raise site, so "how many requests did we block, by policy, by
+    org" (visorshield_requests_blocked_total) covers the whole pipeline —
+    auth, rate limiting and PII fail-closed, not just guardrail hits — from a
+    single place.
+    """
     request.state.parsed_body = body
-    _require_valid_industry_type(request)
-    await auth_middleware(request)
-    await rate_limit_middleware(request)
-    await pii_scan_request(request)
-    await guardrails_middleware(request)
+    try:
+        header_industry_type = _require_valid_industry_type(request)
+    except HTTPException:
+        record_blocked(
+            org_id="unknown",
+            industry_type=request.headers.get("X-Industry-Type", "").strip() or "unknown",
+            pipeline_step="industry_type_validation",
+            reason="invalid_industry_type",
+        )
+        raise
+
+    for step_name, step_fn in _PIPELINE_STEPS:
+        try:
+            await step_fn(request)
+        except HTTPException as exc:
+            claims = getattr(request.state, "jwt_claims", {})
+            record_blocked(
+                org_id=claims.get("org_id"),
+                industry_type=claims.get("industry_type") or header_industry_type,
+                pipeline_step=step_name,
+                reason=_block_reason(exc),
+            )
+            record_pipeline_timing(getattr(request.state, "pipeline_timing", None))
+            raise
 
 
 @router.post("/v1/chat/completions")
@@ -101,6 +143,8 @@ async def chat_completions(request: Request):
                     industry_type=claims.get("industry_type") or request.headers.get("X-Industry-Type", ""),
                     routing_reason="guardrail_block",
                     transaction_id=tx_id,
+                    user_id=claims.get("user_id"),
+                    external_user_id=claims.get("external_user_id"),
                 )
             )
             fire_and_forget_audit(
@@ -117,6 +161,7 @@ async def chat_completions(request: Request):
 
     claims = request.state.jwt_claims
     org_id = claims.get("org_id", "unknown")
+    record_pipeline_timing(request.state.pipeline_timing)
 
     if body.stream:
         return StreamingResponse(
@@ -133,6 +178,7 @@ async def chat_completions(request: Request):
         raise
     except Exception as exc:
         log.error("llm_call_failed", error=str(exc), org_id=org_id, request_id=request.state.request_id)
+        record_outcome(org_id, claims.get("industry_type"), "upstream_error")
         raise HTTPException(status_code=502, detail={"error": "upstream_error", "message": str(exc)})
 
     latency_ms = int((time.monotonic() - pipeline_start) * 1000)
@@ -175,6 +221,7 @@ async def chat_completions(request: Request):
         )
 
     cost_usd = calculate_cost(model_used, input_tokens, output_tokens)
+    record_outcome(org_id, claims.get("industry_type"), "pass")
 
     # Async audit logging (non-blocking)
     fire_and_forget_audit(
@@ -195,6 +242,8 @@ async def chat_completions(request: Request):
             latency_ms=latency_ms,
             industry_type=claims.get("industry_type") or request.headers.get("X-Industry-Type", ""),
             routing_reason=routing_reason,
+            user_id=claims.get("user_id"),
+            external_user_id=claims.get("external_user_id"),
         )
     )
 
@@ -267,6 +316,7 @@ async def _stream_response(
                 yield f"{stripped}\n\n" if not stripped.endswith("\n") else f"{stripped}\n"
     except Exception as exc:
         log.error("stream_failed", error=str(exc), org_id=org_id, request_id=request.state.request_id)
+        record_outcome(org_id, claims.get("industry_type"), "upstream_error")
         yield "data: [DONE]\n\n"
         return
 
@@ -321,6 +371,7 @@ async def _stream_response(
 
     latency_ms = int((time.monotonic() - pipeline_start) * 1000)
     cost_usd = calculate_cost(model_used, input_tokens, output_tokens)
+    record_outcome(org_id, claims.get("industry_type"), "pass")
 
     fire_and_forget_audit(
         log_transaction(
@@ -340,6 +391,8 @@ async def _stream_response(
             latency_ms=latency_ms,
             industry_type=claims.get("industry_type") or request.headers.get("X-Industry-Type", ""),
             routing_reason=routing_reason,
+            user_id=claims.get("user_id"),
+            external_user_id=claims.get("external_user_id"),
         )
     )
 

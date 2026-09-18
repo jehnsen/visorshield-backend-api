@@ -2,7 +2,7 @@ import uuid
 import structlog
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from app.config import settings
 from app.routers import proxy, audit, admin, extension
@@ -10,6 +10,7 @@ from app.db.database import check_db_health
 from app.middleware.rate_limit import get_redis
 from app.middleware.pii_engine import get_analyzer
 from app.middleware.guardrails import get_embedding_model, warmup_embeddings
+from app.services.metrics import render_metrics, CONTENT_TYPE_LATEST
 
 # Configure structlog
 structlog.configure(
@@ -88,6 +89,15 @@ app.include_router(proxy.router)
 app.include_router(extension.router)
 app.include_router(audit.router)
 app.include_router(admin.router)
+
+
+@app.get("/metrics", tags=["observability"])
+async def metrics():
+    """
+    Prometheus scrape endpoint. Unauthenticated like /health — scope access at
+    the network layer, not the app layer, same as any Prometheus exporter.
+    """
+    return Response(content=render_metrics(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/health", tags=["health"])

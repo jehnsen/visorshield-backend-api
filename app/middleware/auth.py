@@ -153,6 +153,18 @@ async def auth_middleware(request: Request) -> dict:
             },
         )
 
+    # X-VisorShield-User identifies the human/service behind this call. A JWT
+    # is issued per app/org, not per person, so without this header every
+    # caller under a shared API key is indistinguishable — "who is using
+    # which AI service" (FinOps, identity-aware policy) is unanswerable.
+    # Required, like the other identifying headers above.
+    external_user_id = request.headers.get("X-VisorShield-User", "").strip()
+    if not external_user_id:
+        raise HTTPException(status_code=422, detail={"error": "missing_visorshield_user_header"})
+
+    from app.services.identity_service import get_or_create_user
+    identity = await get_or_create_user(org_id, external_user_id)
+
     # Verify the org and API key are still active, and pull the org's current
     # admin-configured limits — these override the JWT's own copies below so
     # that changes made via /admin/organizations take effect immediately.
@@ -202,6 +214,9 @@ async def auth_middleware(request: Request) -> dict:
         "allow_streaming_passthrough": allow_streaming_passthrough,
         "industry_type": industry_type,
         "sub": sub,
+        "external_user_id": external_user_id,
+        "user_id": identity.get("id") if identity else None,
+        "department_id": identity.get("department_id") if identity else None,
     }
 
     elapsed = (time.monotonic() - start) * 1000

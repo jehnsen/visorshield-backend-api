@@ -232,6 +232,8 @@ async def scan_prompt(request: Request, body: ExtensionScanRequest) -> Extension
             industry_type=industry_type,
             routing_reason="extension_scan",
             transaction_id=transaction_id,
+            user_id=claims.get("user_id"),
+            external_user_id=claims.get("external_user_id"),
         )
     )
 
@@ -281,6 +283,8 @@ def _audit_blocked_scan(
             industry_type=industry_type,
             routing_reason="guardrail_block",
             transaction_id=transaction_id,
+            user_id=claims.get("user_id"),
+            external_user_id=claims.get("external_user_id"),
         )
     )
     fire_and_forget_audit(
@@ -390,6 +394,16 @@ async def heartbeat(
     """Liveness ping. Lets the dashboard show which devices are actually protected."""
     await auth_middleware(request)
     claims = request.state.jwt_claims
+
+    from app.services.inventory_service import record_browser_installation
+    fire_and_forget_audit(
+        record_browser_installation(
+            org_id=claims.get("org_id", "unknown"),
+            device_id=body.device_id,
+            extension_version=body.extension_version,
+            user_id=claims.get("user_id"),
+        )
+    )
 
     log.info(
         "extension_heartbeat",

@@ -16,6 +16,7 @@ CHAT_PAYLOAD = {
 HEALTHCARE_HEADERS = {
     "X-Industry-Type": "healthcare",
     "X-Org-ID": "test-org-123",
+    "X-VisorShield-User": "test-user-1",
 }
 
 
@@ -121,3 +122,27 @@ async def test_health_endpoint(client):
     data = resp.json()
     assert "status" in data
     assert "services" in data
+
+
+async def test_metrics_endpoint_exposes_prometheus_text(client):
+    """/metrics is unauthenticated and returns Prometheus exposition text."""
+    resp = await client.get("/metrics")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/plain")
+    assert "visorshield_requests_total" in resp.text
+    assert "visorshield_requests_blocked_total" in resp.text
+
+
+async def test_metrics_count_blocked_requests_by_org_and_policy(client):
+    """
+    A pipeline block (missing auth here) must show up in
+    visorshield_requests_blocked_total labeled by org_id, industry_type and
+    pipeline_step — the "blocked by policy, by org" demo metric.
+    """
+    resp = await client.post("/v1/chat/completions", json=CHAT_PAYLOAD, headers=HEALTHCARE_HEADERS)
+    assert resp.status_code == 401
+
+    metrics_resp = await client.get("/metrics")
+    body = metrics_resp.text
+    assert 'visorshield_requests_blocked_total{industry_type="healthcare"' in body
+    assert 'pipeline_step="auth"' in body
