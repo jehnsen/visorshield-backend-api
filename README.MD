@@ -22,6 +22,8 @@ Without a governance layer, **that data goes directly to a foreign cloud provide
 
 ---
 
+See [`docs/Overview.md`](docs/Overview.md) for a deeper architecture walkthrough than this README covers.
+
 ## How It Works
 
 ```
@@ -31,11 +33,16 @@ Your App  →  POST /v1/chat/completions  →  VisorShield  →  OpenAI / Anthro
                                     │  1. Auth & RBAC      │
                                     │  2. Rate Limiting    │
                                     │  3. PII Masking      │
-                                    │  4. Guardrails       │
-                                    │  5. Response Scan    │
+                                    │  4. Guardrails (3 layers)│
+                                    │  5. Response Scan +  │
+                                    │     PII Rehydration  │
                                     │  6. Audit Logging    │
                                     └─────────────────────┘
 ```
+
+Requests are also accepted through a **browser extension surface**
+(`POST /v1/extension/*`) for staff who paste prompts directly into
+chatgpt.com instead of calling an API — see [Browser Extension Support](#browser-extension-support).
 
 Clients switch from OpenAI to VisorShield by changing **one line**:
 
@@ -51,11 +58,13 @@ client = OpenAI(base_url="https://your-visorshield-instance.com/v1")
 
 ## Features
 
-### PII Masking (Prompt & Response)
-Detects and replaces sensitive entities before the prompt leaves your infrastructure. Also scans the LLM response — because models can reconstruct PII from context.
+### PII Masking, Rehydration & Response Scanning
+Detects and replaces sensitive entities before the prompt leaves your infrastructure, using Microsoft Presidio. The LLM response is scanned too — because models can reconstruct or echo back PII from context.
+
+If **rehydration** is enabled (`PII_REHYDRATION_ENABLED`, default on), the caller's *own* masked values are restored into the final response after the response scan runs — the client sees real names, not `[PERSON_1]` tokens, while the LLM itself never saw them. Streaming (SSE) responses are buffered in full before scanning/rehydration; there is no partial-chunk PII exposure.
 
 ### Industry Policy Profiles
-Set via a single request header. Four built-in templates:
+Set via a single request header, cross-checked against the caller's JWT so the header alone can never select a weaker policy. Four built-in templates:
 
 | Profile | Header Value | Compliance Target |
 |---|---|---|
@@ -65,11 +74,12 @@ Set via a single request header. Four built-in templates:
 | Legal / HR | `legal_hr` | Bias & sensitivity filtering |
 
 ### Compliance Guardrails
-Two-layer policy enforcement:
+Three-layer policy enforcement, first hit blocks with `451`:
 - **Layer 1** — Fast keyword/regex blocklist (sub-millisecond)
-- **Layer 2** — Embedding similarity check against prohibited topic vectors
+- **Layer 2** — Prompt-injection heuristics ("ignore previous instructions" family)
+- **Layer 3** — Embedding similarity against prohibited-topic vectors, searched per-org first: each org can define its own guardrail topics (stored in Postgres via `pgvector`, queried with an ivfflat cosine index), falling back to the built-in default topics for orgs that haven't customized theirs
 
-Example: An LGU chatbot won't give medical advice. A finance bot won't give legal advice. Violations are blocked and logged as incidents.
+Example: An LGU chatbot won't give medical advice. A finance bot won't give legal advice. Violations are blocked and logged as incidents — and optionally pushed to an HMAC-signed webhook in real time (see below).
 
 ### Cost Control & Smart Routing
 - Per-org monthly token budgets enforced via Redis
@@ -77,7 +87,13 @@ Example: An LGU chatbot won't give medical advice. A finance bot won't give lega
 - Automatic model downgrade for simple prompts (saves cost without degrading output quality)
 - Real-time cost tracking per request, per department, per month
 
-### Audit Ledger
+### Identity & Departments
+`X-VisorShield-User` (required on every request) is resolved into a `User` row, auto-provisioned on first sight — so usage under a shared app/API key is no longer anonymous. Admins curate `departments` and cross-cutting `groups`, and can query "who is using AI, how much" via `GET /audit/usage-by-user`. Identity resolution itself fails **open** (a DB hiccup degrades to `user_id: None`, never blocks the request) — it's an enrichment layer, not a security gate.
+
+### AI Inventory (Shadow AI Discovery)
+Providers, models, calling applications, and browser-extension installations are all **auto-discovered from observed traffic** — nothing to hand-enter. Toggle governance flags (`is_sanctioned`) per model or app via `/admin/inventory/*` once you see what's actually being called.
+
+### Audit Ledger with Tamper-Evident Hash Chain
 Every request is logged with:
 - Prompt hash (SHA-256 — raw prompts are never stored)
 - PII entity types detected (not the values)
@@ -86,7 +102,18 @@ Every request is logged with:
 - Compliance pass/fail status
 - Latency per pipeline step
 
+Every `Transaction` and `GuardrailIncident` row also commits to a per-org SHA-256 **hash chain** (`record_hash = sha256(prev_hash || fields)`), and a database trigger rejects any `UPDATE`/`DELETE` on those tables outright — at the engine level, regardless of which role issues the statement. `GET /audit/verify` recomputes the chain and reports the first broken link, if any. `GET /audit/export` streams a bulk CSV/JSON download for offline re-verification.
+
 Built for SOC2 audits, COA transparency requirements, and DPO reviews.
+
+### Prometheus Metrics
+`GET /metrics` exposes request/block/incident counters and per-pipeline-step latency histograms, labeled by org, industry profile, pipeline step, and reason — so "how many requests did we block, by policy, by org" is a dashboard query, not a log grep.
+
+### Webhook Alerts
+Guardrail incidents can be pushed in real time to any HTTPS endpoint (`WEBHOOK_URL`), signed with HMAC-SHA256 (`X-VisorShield-Signature`) and filterable by detection layer (`WEBHOOK_MIN_SEVERITY`). Delivery is fire-and-forget and never adds latency to — or blocks — the client response.
+
+### Browser Extension Support
+For staff who paste prompts directly into chatgpt.com rather than calling an API, `POST /v1/extension/*` runs the same auth/rate-limit/PII/guardrail pipeline and hands back a masked prompt + entity map for the extension to type into the page itself. VisorShield is never in the network path for that traffic — see [Browser Extension Endpoints](#browser-extension-endpoints).
 
 ---
 
@@ -121,9 +148,13 @@ This starts:
 
 ### 3. Run database migrations
 
+`docker-compose up` already runs a one-shot `migrate` service (`alembic upgrade head`) before the API container starts, so this step is normally automatic. To run it manually (e.g. after pulling new migrations):
+
 ```bash
-docker exec -i visorshield-api psql $DATABASE_URL < app/db/migrations/001_initial.sql
+docker exec -it visorshield-api alembic upgrade head
 ```
+
+`app/db/migrations/001_initial.sql` is a legacy schema snapshot kept for reference only — `alembic/versions/` is the authoritative migration history. Migration `0002` requires the Postgres `pgvector` extension (used for per-org guardrail topics); the official `pgvector/pgvector` Postgres image used in `docker-compose.yml` has it preinstalled.
 
 ### 4. Download NLP models (first run only)
 
@@ -177,11 +208,14 @@ Sign with your `JWT_SECRET` using HS256.
 
 ## Making Your First Request
 
+Every request needs five headers — `Authorization`, `X-Industry-Type`, `X-Org-ID`, `X-VisorShield-User`, and `Content-Type`. `X-VisorShield-User` is your own caller identity (SSO subject, email, or employee ID); VisorShield auto-provisions a `User` row for it on first sight — it doesn't authenticate it, only tracks it for usage-by-user reporting.
+
 ```bash
 curl -X POST http://localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer <your_jwt>" \
   -H "X-Industry-Type: govtech" \
   -H "X-Org-ID: your-org-uuid" \
+  -H "X-VisorShield-User: juan.delacruz@lgu.gov.ph" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gpt-4o-mini",
@@ -216,8 +250,19 @@ X-VisorShield-Model-Used: gpt-4o-mini
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `POST` | `/v1/chat/completions` | OpenAI-compatible chat endpoint |
+| `POST` | `/v1/chat/completions` | OpenAI-compatible chat endpoint (streaming and non-streaming) |
 | `GET` | `/health` | Service health check |
+| `GET` | `/metrics` | Prometheus exposition (unauthenticated — scope access at the network layer) |
+
+### Browser Extension Endpoints
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/v1/extension/scan` | Steps 1–4 on a captured prompt → masked text + entity map, or `451` |
+| `POST` | `/v1/extension/response-scan` | Step 5 on the assistant's answer; types + placeholders only |
+| `GET` | `/v1/extension/policy` | Device policy, `fail_mode: closed` |
+| `POST` | `/v1/extension/events` | Metadata-only telemetry |
+| `POST` | `/v1/extension/heartbeat` | Device liveness — upserts a `browser_installations` row |
 
 ### Audit (requires `compliance_officer` or `admin` role)
 
@@ -227,15 +272,33 @@ X-VisorShield-Model-Used: gpt-4o-mini
 | `GET` | `/audit/transactions/{id}` | Single transaction detail |
 | `GET` | `/audit/incidents` | Guardrail violation incidents |
 | `GET` | `/audit/summary` | Aggregate stats (tokens, cost, PII events, compliance rate) |
+| `GET` | `/audit/usage-by-user` | Usage rollup by `X-VisorShield-User` identity |
+| `GET` | `/audit/export` | Bulk CSV/JSON export (up to 50,000 rows/call), includes hash-chain fields |
+| `GET` | `/audit/verify` | Recomputes the per-org hash chain; reports the first broken link, if any |
 
 ### Admin (requires `admin` role)
 
 | Method | Endpoint | Description |
 |---|---|---|
 | `POST` | `/admin/organizations` | Create a new organization |
+| `PATCH` | `/admin/organizations/{id}` | Update org limits (`allowed_models`, `requests_per_second`, `monthly_token_budget`, ...) |
+| `DELETE` | `/admin/organizations/{id}` | Deactivate an organization |
 | `POST` | `/admin/api-keys` | Generate API key for an org |
+| `DELETE` | `/admin/api-keys/{id}` | Revoke an API key |
 | `GET` | `/admin/organizations/{id}/usage` | Current month usage vs. budget |
+| `POST` | `/admin/organizations/{id}/policy-embeddings` | Upsert per-org custom guardrail topics (pgvector, Layer 3) |
+| `GET` | `/admin/organizations/{id}/policy-embeddings` | List an org's custom guardrail topics |
+| `DELETE` | `/admin/organizations/{id}/policy-embeddings/{profile}` | Clear an org's custom topics for a profile (reverts to defaults) |
 | `POST` | `/admin/reports/monthly` | Generate monthly usage summary |
+| `POST` / `GET` | `/admin/departments` | Create / list org departments |
+| `POST` / `GET` | `/admin/groups` | Create / list org groups |
+| `POST` | `/admin/groups/{id}/members/{user_id}` | Add a user to a group |
+| `GET` | `/admin/users` | List org users (auto-provisioned from `X-VisorShield-User`) |
+| `PATCH` | `/admin/users/{id}` | Curate a user (department, email, display name, active flag) |
+| `GET` / `PATCH` | `/admin/inventory/providers` | List / sanction auto-discovered LLM providers |
+| `GET` / `PATCH` | `/admin/inventory/models` | List / sanction auto-discovered models |
+| `GET` / `PATCH` | `/admin/inventory/apps` | List / sanction calling applications (shadow AI surface) |
+| `GET` | `/admin/inventory/devices` | List browser-extension installations |
 
 ---
 
@@ -278,13 +341,24 @@ Test coverage targets:
 | `ANTHROPIC_API_KEY` | Yes* | Anthropic API key |
 | `JWT_SECRET` | Yes | HS256 signing secret (min 32 chars) |
 | `JWT_ALGORITHM` | No | Default: `HS256` |
+| `JWT_EXPIRY_HOURS` | No | Default: `24` |
 | `DEFAULT_PROVIDER` | No | Default: `openai` |
 | `FALLBACK_PROVIDER` | No | Default: `anthropic` |
 | `EMBEDDING_MODEL` | No | Default: `paraphrase-MiniLM-L6-v2` |
+| `PGVECTOR_DIMENSIONS` | No | Default: `384` — must match `EMBEDDING_MODEL`'s output dimension |
+| `EMBEDDING_CACHE_TTL_SECONDS` | No | Default: `300` — TTL for the per-org "has custom topics" presence cache |
+| `IVFFLAT_PROBES` | No | Default: `5` — recall/latency tradeoff for the pgvector ANN search |
+| `EMBEDDING_SIMILARITY_THRESHOLD` | No | Default: `0.72` — cosine similarity cutoff for Guardrail Layer 3 |
+| `GUARDRAIL_PROMPT_INJECTION_ENABLED` | No | Default: `true` — Guardrail Layer 2 |
+| `PII_REHYDRATION_ENABLED` | No | Default: `true` — restore caller's own PII in the final response |
+| `WEBHOOK_URL` | No | HTTPS endpoint for guardrail-incident alerts; unset disables webhooks entirely |
+| `WEBHOOK_SECRET` | No* | HMAC-SHA256 signing secret — required if `WEBHOOK_URL` is set (enforced in production) |
+| `WEBHOOK_MIN_SEVERITY` | No | Default: `all` — filter by detection layer (`all` / `keyword` / `prompt_injection` / `embedding`) |
+| `AUTH_FAIL_OPEN_ON_DB_ERROR` | No | Default: `false` — never `true` in production; see Security Notes |
 | `LOG_LEVEL` | No | Default: `INFO` |
-| `ENVIRONMENT` | No | `development / production` |
+| `ENVIRONMENT` | No | `development / staging / production` |
 
-*At least one provider key is required.
+*At least one provider key is required. `WEBHOOK_SECRET` is required only when `WEBHOOK_URL` is set.
 
 ---
 
@@ -331,13 +405,15 @@ See `app/policies/govtech.py` as the reference implementation (includes custom P
 | Item | Status |
 |---|---|
 | PDF report generation for monthly audits | Planned |
-| pgvector upgrade for guardrails (replace in-memory embeddings) | Planned |
-| Webhook alerts on quota threshold / guardrail spikes | Planned |
+| Per-org guardrail topics via pgvector (Layer 3) | Shipped |
+| Webhook alerts on guardrail incidents | Shipped — quota-threshold alerts still planned |
+| PII rehydration (re-inject caller's masked values into the response) | Shipped |
+| Streaming (SSE) response support | Shipped — buffered before PII scan/rehydration, not scanned chunk-by-chunk |
+| AI inventory auto-discovery (providers/models/apps/devices) | Shipped |
+| Audit hash-chain integrity + append-only enforcement | Shipped |
 | Multi-region data residency config | Planned |
-| De-anonymization (re-inject masked values into response) | Experimental |
 | Web dashboard (Next.js) | Separate repo |
 | Support for Azure OpenAI endpoint | Planned |
-| Streaming response PII scan (real-time chunk scanning) | In progress |
 
 ---
 
@@ -348,15 +424,8 @@ See `app/policies/govtech.py` as the reference implementation (includes custom P
 - The PII engine **fails closed** — any Presidio exception blocks the request. It will never fail silently and forward unmasked data.
 - All Redis keys are org-namespaced to prevent cross-tenant data leakage.
 - JWT secrets should be rotated regularly and stored in a secrets manager in production.
-
----
-
-New Endpoints &	What it does:
-POST /v1/extension/scan	Steps 1–4 on a captured prompt → masked text + entity map, or 451
-POST /v1/extension/response-scan	Step 5 on the assistant's answer; types + placeholders only
-GET /v1/extension/policy	Device policy, fail_mode: closed
-POST /v1/extension/events	Metadata-only telemetry
-POST /v1/extension/heartbeat	Device liveness
+- Audit rows are tamper-evident: a per-org SHA-256 hash chain plus a database-level append-only trigger reject any `UPDATE`/`DELETE` on `transactions` or `guardrail_incidents`, regardless of which role issues the statement. `GET /audit/verify` detects the first broken link, if any.
+- The auth org/API-key active check fails **closed** by default (`AUTH_FAIL_OPEN_ON_DB_ERROR=false`) — if Postgres is unreachable, the request is blocked (`503`) rather than let a possibly-revoked key through. `config.py` refuses to start in production with this flipped.
 
 ## License
 

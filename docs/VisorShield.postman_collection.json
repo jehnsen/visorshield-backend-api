@@ -20,7 +20,13 @@
     { "key": "device_id", "value": "fafefb1f-a7ac-4dd8-aa75-46192887d27e", "type": "string" },
     { "key": "key_id_to_revoke", "value": "4ea96437-3ca3-4c4d-a8a0-73789f8212a1", "type": "string" },
     { "key": "org_id_created", "value": "", "type": "string" },
-    { "key": "api_key_id_created", "value": "", "type": "string" }
+    { "key": "api_key_id_created", "value": "", "type": "string" },
+    { "key": "caller_user", "value": "agent.delacruz@metropacificbpo.com.ph", "type": "string" },
+    { "key": "model_id", "value": "", "type": "string" },
+    { "key": "app_id", "value": "", "type": "string" },
+    { "key": "department_id", "value": "", "type": "string" },
+    { "key": "group_id", "value": "", "type": "string" },
+    { "key": "user_id", "value": "", "type": "string" }
   ],
   "event": [
     {
@@ -32,6 +38,13 @@
           "// every request, since VisorShield has no /login endpoint — tokens are",
           "// issued out-of-band and only need to satisfy app/middleware/auth.py.",
           "// Uses CryptoJS, which ships in the Postman sandbox.",
+          "//",
+          "// industry_type is minted PER REQUEST from that request's own",
+          "// X-Industry-Type header (defaulting to 'govtech' for requests that",
+          "// don't set one, e.g. Admin/Audit calls) because auth.py rejects any",
+          "// token whose industry_type claim doesn't exactly match the header —",
+          "// see CLAUDE.md 'JWT Claims Schema'. A single fixed claim value can't",
+          "// serve the govtech/healthcare/fintech/legal_hr examples below.",
           "",
           "function base64url(wordArray) {",
           "    return CryptoJS.enc.Base64.stringify(wordArray)",
@@ -53,11 +66,13 @@
           "const orgId = pm.collectionVariables.get('org_id');",
           "const now = Math.floor(Date.now() / 1000);",
           "const allowedModels = ['gpt-4o-mini', 'gpt-4o', 'claude-haiku-4-5', 'claude-sonnet-4-5'];",
+          "// This request's own X-Industry-Type header, if it sets one.",
+          "const requestIndustryType = (pm.request.headers.get('X-Industry-Type') || 'govtech').toLowerCase();",
           "",
           "const roles = [",
-          "    { varName: 'jwt_app', role: 'app', sub: pm.collectionVariables.get('api_key_id_app'), rpm: 20 },",
-          "    { varName: 'jwt_admin', role: 'admin', sub: pm.collectionVariables.get('api_key_id_admin'), rpm: 50 },",
-          "    { varName: 'jwt_compliance', role: 'compliance_officer', sub: pm.collectionVariables.get('api_key_id_compliance'), rpm: 50 }",
+          "    { varName: 'jwt_app', role: 'app', sub: pm.collectionVariables.get('api_key_id_app'), rps: 20 },",
+          "    { varName: 'jwt_admin', role: 'admin', sub: pm.collectionVariables.get('api_key_id_admin'), rps: 50 },",
+          "    { varName: 'jwt_compliance', role: 'compliance_officer', sub: pm.collectionVariables.get('api_key_id_compliance'), rps: 50 }",
           "];",
           "",
           "roles.forEach(function (r) {",
@@ -67,8 +82,9 @@
           "        app_source: 'BPO-CRM-Widget',",
           "        role: r.role,",
           "        allowed_models: allowedModels,",
-          "        rpm_limit: r.rpm,",
+          "        requests_per_second: r.rps,",
           "        monthly_token_budget: 5000000,",
+          "        industry_type: requestIndustryType,",
           "        allow_streaming_passthrough: false,",
           "        iat: now,",
           "        exp: now + 3600",
@@ -81,7 +97,7 @@
   ],
   "item": [
     {
-      "name": "Health",
+      "name": "Health & Metrics",
       "item": [
         {
           "name": "Health Check",
@@ -90,6 +106,16 @@
             "header": [],
             "url": { "raw": "{{base_url}}/health", "host": ["{{base_url}}"], "path": ["health"] },
             "description": "Liveness/readiness probe. Checks Postgres, Redis, Presidio and the embedding model. Returns 503 if any dependency is down."
+          },
+          "response": []
+        },
+        {
+          "name": "Prometheus Metrics",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{base_url}}/metrics", "host": ["{{base_url}}"], "path": ["metrics"] },
+            "description": "Unauthenticated, like /health — scope access at the network layer. Exposes visorshield_requests_total, visorshield_requests_blocked_total, visorshield_guardrail_incidents_total and visorshield_pipeline_step_duration_ms in Prometheus exposition format."
           },
           "response": []
         }
@@ -106,6 +132,7 @@
               { "key": "Content-Type", "value": "application/json" },
               { "key": "X-Industry-Type", "value": "govtech" },
               { "key": "X-Org-ID", "value": "{{org_id}}" },
+              { "key": "X-VisorShield-User", "value": "{{caller_user}}" },
               { "key": "Authorization", "value": "Bearer {{jwt_app}}" }
             ],
             "url": { "raw": "{{base_url}}/v1/chat/completions", "host": ["{{base_url}}"], "path": ["v1", "chat", "completions"] },
@@ -126,6 +153,7 @@
               { "key": "Content-Type", "value": "application/json" },
               { "key": "X-Industry-Type", "value": "healthcare" },
               { "key": "X-Org-ID", "value": "{{org_id}}" },
+              { "key": "X-VisorShield-User", "value": "{{caller_user}}" },
               { "key": "Authorization", "value": "Bearer {{jwt_app}}" }
             ],
             "url": { "raw": "{{base_url}}/v1/chat/completions", "host": ["{{base_url}}"], "path": ["v1", "chat", "completions"] },
@@ -146,6 +174,7 @@
               { "key": "Content-Type", "value": "application/json" },
               { "key": "X-Industry-Type", "value": "fintech" },
               { "key": "X-Org-ID", "value": "{{org_id}}" },
+              { "key": "X-VisorShield-User", "value": "{{caller_user}}" },
               { "key": "Authorization", "value": "Bearer {{jwt_app}}" }
             ],
             "url": { "raw": "{{base_url}}/v1/chat/completions", "host": ["{{base_url}}"], "path": ["v1", "chat", "completions"] },
@@ -166,6 +195,7 @@
               { "key": "Content-Type", "value": "application/json" },
               { "key": "X-Industry-Type", "value": "legal_hr" },
               { "key": "X-Org-ID", "value": "{{org_id}}" },
+              { "key": "X-VisorShield-User", "value": "{{caller_user}}" },
               { "key": "Authorization", "value": "Bearer {{jwt_app}}" }
             ],
             "url": { "raw": "{{base_url}}/v1/chat/completions", "host": ["{{base_url}}"], "path": ["v1", "chat", "completions"] },
@@ -186,6 +216,7 @@
               { "key": "Content-Type", "value": "application/json" },
               { "key": "X-Industry-Type", "value": "govtech" },
               { "key": "X-Org-ID", "value": "{{org_id}}" },
+              { "key": "X-VisorShield-User", "value": "{{caller_user}}" },
               { "key": "Authorization", "value": "Bearer {{jwt_app}}" },
               { "key": "Accept", "value": "text/event-stream" }
             ],
@@ -207,6 +238,7 @@
               { "key": "Content-Type", "value": "application/json" },
               { "key": "X-Industry-Type", "value": "govtech" },
               { "key": "X-Org-ID", "value": "{{org_id}}" },
+              { "key": "X-VisorShield-User", "value": "{{caller_user}}" },
               { "key": "Authorization", "value": "Bearer {{jwt_app}}" }
             ],
             "url": { "raw": "{{base_url}}/v1/chat/completions", "host": ["{{base_url}}"], "path": ["v1", "chat", "completions"] },
@@ -227,6 +259,7 @@
               { "key": "Content-Type", "value": "application/json" },
               { "key": "X-Industry-Type", "value": "fintech" },
               { "key": "X-Org-ID", "value": "{{org_id}}" },
+              { "key": "X-VisorShield-User", "value": "{{caller_user}}" },
               { "key": "Authorization", "value": "Bearer {{jwt_app}}" }
             ],
             "url": { "raw": "{{base_url}}/v1/chat/completions", "host": ["{{base_url}}"], "path": ["v1", "chat", "completions"] },
@@ -246,6 +279,7 @@
             "header": [
               { "key": "Content-Type", "value": "application/json" },
               { "key": "X-Org-ID", "value": "{{org_id}}" },
+              { "key": "X-VisorShield-User", "value": "{{caller_user}}" },
               { "key": "Authorization", "value": "Bearer {{jwt_app}}" }
             ],
             "url": { "raw": "{{base_url}}/v1/chat/completions", "host": ["{{base_url}}"], "path": ["v1", "chat", "completions"] },
@@ -290,6 +324,7 @@
               { "key": "Content-Type", "value": "application/json" },
               { "key": "X-Industry-Type", "value": "govtech" },
               { "key": "X-Org-ID", "value": "{{org_id}}" },
+              { "key": "X-VisorShield-User", "value": "{{caller_user}}" },
               { "key": "Authorization", "value": "Bearer {{jwt_app}}" }
             ],
             "url": { "raw": "{{base_url}}/v1/extension/scan", "host": ["{{base_url}}"], "path": ["v1", "extension", "scan"] },
@@ -324,6 +359,7 @@
               { "key": "Content-Type", "value": "application/json" },
               { "key": "X-Industry-Type", "value": "govtech" },
               { "key": "X-Org-ID", "value": "{{org_id}}" },
+              { "key": "X-VisorShield-User", "value": "{{caller_user}}" },
               { "key": "Authorization", "value": "Bearer {{jwt_app}}" }
             ],
             "url": { "raw": "{{base_url}}/v1/extension/response-scan", "host": ["{{base_url}}"], "path": ["v1", "extension", "response-scan"] },
@@ -341,6 +377,9 @@
           "request": {
             "method": "GET",
             "header": [
+              { "key": "X-Industry-Type", "value": "govtech" },
+              { "key": "X-Org-ID", "value": "{{org_id}}" },
+              { "key": "X-VisorShield-User", "value": "{{caller_user}}" },
               { "key": "Authorization", "value": "Bearer {{jwt_app}}" }
             ],
             "url": { "raw": "{{base_url}}/v1/extension/policy", "host": ["{{base_url}}"], "path": ["v1", "extension", "policy"] },
@@ -354,6 +393,9 @@
             "method": "POST",
             "header": [
               { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Industry-Type", "value": "govtech" },
+              { "key": "X-Org-ID", "value": "{{org_id}}" },
+              { "key": "X-VisorShield-User", "value": "{{caller_user}}" },
               { "key": "Authorization", "value": "Bearer {{jwt_app}}" }
             ],
             "url": { "raw": "{{base_url}}/v1/extension/events", "host": ["{{base_url}}"], "path": ["v1", "extension", "events"] },
@@ -372,6 +414,9 @@
             "method": "POST",
             "header": [
               { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Industry-Type", "value": "govtech" },
+              { "key": "X-Org-ID", "value": "{{org_id}}" },
+              { "key": "X-VisorShield-User", "value": "{{caller_user}}" },
               { "key": "Authorization", "value": "Bearer {{jwt_app}}" }
             ],
             "url": { "raw": "{{base_url}}/v1/extension/heartbeat", "host": ["{{base_url}}"], "path": ["v1", "extension", "heartbeat"] },
@@ -459,6 +504,85 @@
             ],
             "url": { "raw": "{{base_url}}/audit/summary", "host": ["{{base_url}}"], "path": ["audit", "summary"] },
             "description": "Aggregate totals for the caller's org: requests, tokens, cost, PII events prevented, guardrail hits, compliance rate."
+          },
+          "response": []
+        },
+        {
+          "name": "Usage by User",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{jwt_compliance}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/audit/usage-by-user?page=1&page_size=25",
+              "host": ["{{base_url}}"],
+              "path": ["audit", "usage-by-user"],
+              "query": [
+                { "key": "page", "value": "1" },
+                { "key": "page_size", "value": "25" },
+                { "key": "org_id", "value": "{{org_id}}", "disabled": true }
+              ]
+            },
+            "description": "\"Who is using AI, how much\" rollup — cost/tokens/request count grouped by the X-VisorShield-User identity resolved on each transaction. Previously unanswerable: every caller behind a shared API key looked identical."
+          },
+          "response": []
+        },
+        {
+          "name": "Export Transactions (CSV)",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{jwt_compliance}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/audit/export?format=csv",
+              "host": ["{{base_url}}"],
+              "path": ["audit", "export"],
+              "query": [
+                { "key": "format", "value": "csv" },
+                { "key": "org_id", "value": "{{org_id}}", "disabled": true },
+                { "key": "date_from", "value": "2026-09-01T00:00:00Z", "disabled": true },
+                { "key": "date_to", "value": "2026-09-30T23:59:59Z", "disabled": true },
+                { "key": "compliance_status", "value": "pass", "disabled": true }
+              ]
+            },
+            "description": "Bulk download (capped at 50,000 rows/call — page with date_from for more) including the hash-chain fields (chain_seq/prev_hash/record_hash) so the export can be independently re-verified offline."
+          },
+          "response": []
+        },
+        {
+          "name": "Export Transactions (JSON)",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{jwt_compliance}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/audit/export?format=json",
+              "host": ["{{base_url}}"],
+              "path": ["audit", "export"],
+              "query": [
+                { "key": "format", "value": "json" }
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Verify Audit Hash Chain",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{jwt_compliance}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/audit/verify?org_id={{org_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["audit", "verify"],
+              "query": [{ "key": "org_id", "value": "{{org_id}}" }]
+            },
+            "description": "Recomputes the per-org SHA-256 hash chain over transactions + guardrail_incidents and reports the first broken link, if any. What makes \"immutable audit\" a checkable claim rather than a policy statement."
           },
           "response": []
         }
@@ -602,7 +726,7 @@
               "raw": "{\n  \"policy_profile\": \"govtech\",\n  \"topics\": [\n    \"partisan political campaigning\",\n    \"election propaganda\",\n    \"solicitation of bribery from a public office\"\n  ]\n}",
               "options": { "raw": { "language": "json" } }
             },
-            "description": "Org-specific embedding overrides for the Layer 2 (semantic) guardrail check, on top of the default govtech keyword blocklist."
+            "description": "Org-specific embedding overrides for the Layer 3 (semantic) guardrail check, on top of the default govtech keyword blocklist and Layer 2 prompt-injection heuristics."
           },
           "response": []
         },
@@ -634,7 +758,7 @@
               "host": ["{{base_url}}"],
               "path": ["admin", "organizations", "{{org_id_created}}", "policy-embeddings", "govtech"]
             },
-            "description": "Reverts the org to the default in-process govtech embeddings for Layer 2 guardrails."
+            "description": "Reverts the org to the default in-process govtech embeddings for Layer 3 guardrails."
           },
           "response": []
         },
@@ -655,6 +779,322 @@
                 { "key": "month", "value": "9" }
               ]
             }
+          },
+          "response": []
+        },
+        {
+          "name": "Create Department",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{jwt_admin}}" }
+            ],
+            "url": { "raw": "{{base_url}}/admin/departments", "host": ["{{base_url}}"], "path": ["admin", "departments"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"org_id\": \"{{org_id_created}}\",\n  \"name\": \"Citizen Hotline\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "Org-scoped grouping an admin curates — not auto-discovered like AI Inventory. department_id is a single FK on users (see Identity Model in CLAUDE.md).",
+            "event": [
+              {
+                "listen": "test",
+                "script": {
+                  "type": "text/javascript",
+                  "exec": [
+                    "if (pm.response.code === 201) {",
+                    "    const body = pm.response.json();",
+                    "    pm.collectionVariables.set('department_id', body.id);",
+                    "}"
+                  ]
+                }
+              }
+            ]
+          },
+          "response": []
+        },
+        {
+          "name": "List Departments",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{jwt_admin}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/admin/departments?org_id={{org_id_created}}",
+              "host": ["{{base_url}}"],
+              "path": ["admin", "departments"],
+              "query": [{ "key": "org_id", "value": "{{org_id_created}}" }]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Create Group",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{jwt_admin}}" }
+            ],
+            "url": { "raw": "{{base_url}}/admin/groups", "host": ["{{base_url}}"], "path": ["admin", "groups"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"org_id\": \"{{org_id_created}}\",\n  \"name\": \"Night Shift Agents\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "Unlike departments, groups are cross-cutting — a user can belong to several via user_group_memberships.",
+            "event": [
+              {
+                "listen": "test",
+                "script": {
+                  "type": "text/javascript",
+                  "exec": [
+                    "if (pm.response.code === 201) {",
+                    "    const body = pm.response.json();",
+                    "    pm.collectionVariables.set('group_id', body.id);",
+                    "}"
+                  ]
+                }
+              }
+            ]
+          },
+          "response": []
+        },
+        {
+          "name": "List Groups",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{jwt_admin}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/admin/groups?org_id={{org_id_created}}",
+              "host": ["{{base_url}}"],
+              "path": ["admin", "groups"],
+              "query": [{ "key": "org_id", "value": "{{org_id_created}}" }]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "List Users (who is using AI)",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{jwt_admin}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/admin/users?org_id={{org_id}}&page=1&page_size=50",
+              "host": ["{{base_url}}"],
+              "path": ["admin", "users"],
+              "query": [
+                { "key": "org_id", "value": "{{org_id}}" },
+                { "key": "page", "value": "1" },
+                { "key": "page_size", "value": "50" },
+                { "key": "department_id", "value": "{{department_id}}", "disabled": true }
+              ]
+            },
+            "description": "Queries the seeded {{org_id}} (not {{org_id_created}}) by default, since that's the org the Proxy/Extension folders actually send X-VisorShield-User traffic against — users are auto-provisioned, never hand-created, so this list is empty until some traffic runs.",
+            "event": [
+              {
+                "listen": "test",
+                "script": {
+                  "type": "text/javascript",
+                  "exec": [
+                    "if (pm.response.code === 200) {",
+                    "    const body = pm.response.json();",
+                    "    if (body.items && body.items.length > 0) {",
+                    "        pm.collectionVariables.set('user_id', body.items[0].id);",
+                    "    }",
+                    "}"
+                  ]
+                }
+              }
+            ]
+          },
+          "response": []
+        },
+        {
+          "name": "Update User (curate department/name)",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{jwt_admin}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/admin/users/{{user_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["admin", "users", "{{user_id}}"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"display_name\": \"Juan Dela Cruz\",\n  \"email\": \"juan.delacruz@lgu.gov.ph\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "Run List Users first to populate {{user_id}} — users are only ever auto-provisioned from X-VisorShield-User, this endpoint just curates the resulting row."
+          },
+          "response": []
+        },
+        {
+          "name": "Add User to Group",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{jwt_admin}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/admin/groups/{{group_id}}/members/{{user_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["admin", "groups", "{{group_id}}", "members", "{{user_id}}"]
+            },
+            "description": "Groups are cross-cutting (many-to-many). Run Create Group and List Users first so {{group_id}}/{{user_id}} are populated — note the demo group lives under {{org_id_created}} while the demo user lives under {{org_id}}; swap in matching IDs from your own environment for a realistic run."
+          },
+          "response": []
+        },
+        {
+          "name": "List AI Inventory — Providers",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{jwt_admin}}" }
+            ],
+            "url": { "raw": "{{base_url}}/admin/inventory/providers", "host": ["{{base_url}}"], "path": ["admin", "inventory", "providers"] },
+            "description": "Auto-discovered from every completed transaction's (provider, model_used) — not hand-entered. Global, not org-scoped."
+          },
+          "response": []
+        },
+        {
+          "name": "List AI Inventory — Models",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{jwt_admin}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/admin/inventory/models",
+              "host": ["{{base_url}}"],
+              "path": ["admin", "inventory", "models"],
+              "query": [
+                { "key": "provider_id", "value": "", "disabled": true },
+                { "key": "is_sanctioned", "value": "false", "disabled": true }
+              ]
+            },
+            "event": [
+              {
+                "listen": "test",
+                "script": {
+                  "type": "text/javascript",
+                  "exec": [
+                    "if (pm.response.code === 200) {",
+                    "    const body = pm.response.json();",
+                    "    if (body.items && body.items.length > 0) {",
+                    "        pm.collectionVariables.set('model_id', body.items[0].id);",
+                    "    }",
+                    "}"
+                  ]
+                }
+              }
+            ]
+          },
+          "response": []
+        },
+        {
+          "name": "Sanction/Unsanction a Model",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{jwt_admin}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/admin/inventory/models/{{model_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["admin", "inventory", "models", "{{model_id}}"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"is_sanctioned\": true\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "Governance flag only — not a pricing or access-control source. Run List AI Inventory — Models first to populate {{model_id}}."
+          },
+          "response": []
+        },
+        {
+          "name": "List AI Inventory — Apps (Shadow AI)",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{jwt_admin}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/admin/inventory/apps?org_id={{org_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["admin", "inventory", "apps"],
+              "query": [
+                { "key": "org_id", "value": "{{org_id}}" },
+                { "key": "is_sanctioned", "value": "false", "disabled": true }
+              ]
+            },
+            "description": "Auto-discovered from every transaction's app_source — the shadow-AI surface. Queries {{org_id}} since that's the org the Proxy/Extension folders actually generate app_source traffic for.",
+            "event": [
+              {
+                "listen": "test",
+                "script": {
+                  "type": "text/javascript",
+                  "exec": [
+                    "if (pm.response.code === 200) {",
+                    "    const body = pm.response.json();",
+                    "    if (body.items && body.items.length > 0) {",
+                    "        pm.collectionVariables.set('app_id', body.items[0].id);",
+                    "    }",
+                    "}"
+                  ]
+                }
+              }
+            ]
+          },
+          "response": []
+        },
+        {
+          "name": "Sanction/Unsanction an App",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{jwt_admin}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/admin/inventory/apps/{{app_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["admin", "inventory", "apps", "{{app_id}}"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"is_sanctioned\": true\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "Toggle sanctioned status for a calling application. Run List AI Inventory — Apps first to populate {{app_id}}."
+          },
+          "response": []
+        },
+        {
+          "name": "List AI Inventory — Browser Devices",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{jwt_admin}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/admin/inventory/devices?org_id={{org_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["admin", "inventory", "devices"],
+              "query": [{ "key": "org_id", "value": "{{org_id}}" }]
+            },
+            "description": "One row per device_id, upserted by POST /v1/extension/heartbeat — run Browser Extension → Device Heartbeat first to see {{device_id}} appear here."
           },
           "response": []
         },

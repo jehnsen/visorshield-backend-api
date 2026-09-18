@@ -24,9 +24,12 @@ Think of it as a Zero-Trust API Gateway, but specifically designed for AI worklo
 | PII Detection | Microsoft Presidio (presidio-analyzer, presidio-anonymizer) |
 | NLP Model | spaCy en_core_web_lg |
 | Embeddings (Guardrails) | sentence-transformers paraphrase-MiniLM-L6-v2 |
+| Per-org Embedding Store | pgvector (Postgres extension) — ivfflat cosine index |
 | Auth | PyJWT (HS256) |
 | Logging | structlog (JSON structured output) |
 | Metrics | prometheus-client (`GET /metrics`) |
+| Outbound Webhooks | httpx (HMAC-SHA256 signed) |
+| Migrations | Alembic (`alembic/versions/`) |
 | Containerization | Docker + Docker Compose |
 | Testing | pytest + pytest-asyncio + httpx + fakeredis |
 
@@ -43,11 +46,12 @@ visorshield/
 │   ├── middleware/
 │   │   ├── auth.py              # Step 1: JWT validation + RBAC
 │   │   ├── rate_limit.py        # Step 2: Redis spike arrest + monthly quota
-│   │   ├── pii_engine.py        # Step 3: Presidio PII masking (prompt)
-│   │   ├── guardrails.py        # Step 4: Keyword + embedding policy check
+│   │   ├── pii_engine.py        # Step 3: Presidio PII masking (prompt) + rehydrate_pii()
+│   │   ├── guardrails.py        # Step 4: keyword + prompt-injection + pgvector embedding check
 │   │   └── response_scanner.py  # Step 5: Presidio PII scan on LLM response
 │   ├── routers/
-│   │   ├── proxy.py             # POST /v1/chat/completions (OpenAI-compatible)
+│   │   ├── proxy.py             # POST /v1/chat/completions (OpenAI-compatible, streaming + non-streaming)
+│   │   ├── extension.py         # POST /v1/extension/* — browser-extension surface (see below)
 │   │   ├── audit.py             # GET /audit/* endpoints
 │   │   └── admin.py             # POST /admin/* endpoints
 │   ├── models/
@@ -56,6 +60,8 @@ visorshield/
 │   │   ├── audit.py             # SQLAlchemy ORM models (transactions, incidents, chain state)
 │   │   ├── identity.py          # Department, Group, User, UserGroupMembership
 │   │   ├── inventory.py         # AIProvider, AIModel, AIApp, BrowserInstallation
+│   │   ├── embeddings.py        # PolicyEmbedding — per-org pgvector guardrail topics
+│   │   ├── extension.py         # Pydantic contract for the browser-extension surface
 │   │   └── policy.py            # Policy profile enums and config
 │   ├── services/
 │   │   ├── llm_router.py        # Provider routing + cost-based model selection
@@ -64,7 +70,9 @@ visorshield/
 │   │   ├── identity_service.py  # X-VisorShield-User -> User row (get-or-create)
 │   │   ├── inventory_service.py # Auto-discovers providers/models/apps/devices
 │   │   ├── cost_calculator.py   # Real-time token cost computation
-│   │   └── report_service.py    # Monthly usage summary generator
+│   │   ├── report_service.py    # Monthly usage summary generator
+│   │   ├── metrics.py           # Prometheus counters/histograms (GET /metrics)
+│   │   └── webhook_service.py   # HMAC-signed guardrail-incident webhook delivery
 │   ├── db/
 │   │   ├── database.py          # SQLAlchemy async engine + session factory
 │   │   └── migrations/
@@ -74,15 +82,23 @@ visorshield/
 │       ├── fintech.py           # PCI-DSS template: recognizers + blocklist
 │       ├── govtech.py           # COA/DILG template: PH custom recognizers
 │       └── legal_hr.py          # Bias/sensitivity template
+├── alembic/
+│   ├── env.py
+│   └── versions/
+│       ├── 0001_initial_schema.py
+│       ├── 0002_pgvector_policy_embeddings.py
+│       └── 0003_identity_inventory_audit_integrity.py
 ├── tests/
 │   ├── test_proxy.py
 │   ├── test_pii.py
 │   ├── test_auth.py
 │   └── test_guardrails.py
-├── docker-compose.yml
+├── docker-compose.yml            # includes a one-shot `migrate` service (alembic upgrade head)
 ├── Dockerfile
 ├── requirements.txt
 ├── .env.example
+├── docs/
+│   └── Overview.md               # architecture overview for engineers new to the codebase
 ├── CLAUDE.md                    # ← You are here
 └── README.md
 ```
@@ -108,18 +124,34 @@ Incoming Request
       │
       ▼
 [3] pii_engine.py    → Presidio masks PII in prompt using industry template.
+                        Placeholder → original map kept in request.state for
+                        step-5 rehydration; original values never persisted.
       │
       ▼
-[4] guardrails.py    → Keyword blocklist + embedding similarity policy check.
+[4] guardrails.py    → 3 layers, in order, first hit wins (451):
+                          1. Keyword/regex blocklist
+                          2. Prompt-injection heuristics ("ignore previous
+                             instructions" family)
+                          3. Embedding similarity — per-org pgvector topics
+                             (ivfflat cosine search) if the org has any,
+                             else the in-process default topic set
       │
       ▼
   LLM Provider       → Sanitized prompt sent to OpenAI or Anthropic.
+                        Streaming (SSE) requests are buffered in full before
+                        step 5 runs — never scanned/rehydrated chunk-by-chunk.
       │
       ▼
-[5] response_scanner → Presidio masks any PII in the LLM response.
+[5] response_scanner → Presidio masks any PII in the LLM response, then
+                        (if PII_REHYDRATION_ENABLED) rehydrate_pii() restores
+                        the caller's own masked values — order matters: mask
+                        model-introduced PII first, then rehydrate the
+                        caller's, never the reverse.
       │
       ▼
   Audit Logger       → Non-blocking asyncio.create_task() — never blocks response.
+                        Guardrail hits also fire an async webhook (webhook_service.py)
+                        when WEBHOOK_URL is configured — also non-blocking, best-effort.
       │
       ▼
 Client Response
@@ -168,6 +200,78 @@ These are custom Presidio recognizers — regex-based:
 - **PH_PHILSYS** — 16 consecutive digits
 
 These live in `app/policies/govtech.py`. If BIR or PSA changes formats, update the regex there only.
+
+---
+
+## Guardrails: Three-Layer Detection
+
+`app/middleware/guardrails.py` runs three checks in order on every prompt.
+The first hit blocks with 451 — later layers never run once an earlier one
+fires:
+
+1. **Keyword/regex blocklist** — synchronous, sub-millisecond, per policy profile.
+2. **Prompt-injection heuristics** — `_check_prompt_injection()`, the "ignore
+   previous instructions" family. Gated by `GUARDRAIL_PROMPT_INJECTION_ENABLED`.
+3. **Embedding similarity** — cosine similarity against prohibited-topic
+   vectors, threshold `EMBEDDING_SIMILARITY_THRESHOLD` (default `0.72`).
+
+Layer 3 is **per-org first, default second**:
+- Each org can have its own guardrail topics, stored as pgvector rows in
+  `policy_embeddings` (`app/models/embeddings.py`), managed via
+  `POST/GET/DELETE /admin/organizations/{org_id}/policy-embeddings`. These are
+  searched with the `idx_policy_embeddings_ivfflat` cosine index
+  (`IVFFLAT_PROBES` controls the recall/latency tradeoff).
+- Whether an org has *any* custom topics is cached in-process for
+  `EMBEDDING_CACHE_TTL_SECONDS` (a cheap `EXISTS` check) — the ANN search
+  itself always hits Postgres live, so it stays correct as topics grow.
+  `POST .../policy-embeddings` invalidates this presence cache immediately
+  after writing (`invalidate_embedding_cache`).
+- If an org has no custom rows for a policy profile (or the presence check
+  itself errors), guardrails fall back to the in-process default topics for
+  that profile, pre-computed once at startup by `warmup_embeddings()`.
+- Never add a fourth layer or reorder these three without updating this file.
+
+---
+
+## PII Rehydration
+
+`pii_engine.py`'s `rehydrate_pii()` restores the caller's own PII — the
+values step 3 masked out of the prompt — back into the final response, so the
+client sees real names instead of `[PERSON_1]` tokens. Gated by
+`PII_REHYDRATION_ENABLED` (default `true`).
+
+**Order matters, in `proxy.py`**: response_scanner (step 5) masks any PII the
+*model* introduced first, then rehydration restores the *caller's* masked
+values second. Never reverse this order — rehydrating first could hand the
+response scanner values it would otherwise have flagged.
+
+Streaming (SSE) responses are buffered in full before step 5 and rehydration
+run — there is no per-chunk scanning. A response is never streamed to the
+client until both steps have completed.
+
+The one field that ever carries a real PII value in this system is
+`ScanEntity.original` on the `/v1/extension/scan` response
+(`app/models/extension.py`) — returned only to the extension that submitted
+the prompt, never persisted, never logged, never part of an audit row.
+
+---
+
+## Webhook Alerts
+
+`app/services/webhook_service.py` posts an HMAC-SHA256-signed JSON event to
+`WEBHOOK_URL` whenever a guardrail incident is logged
+(`audit_service.log_guardrail_incident()` calls `send_guardrail_alert()`).
+
+- No-ops silently if `WEBHOOK_URL` is unset — this is an optional integration,
+  not a gate.
+- `WEBHOOK_MIN_SEVERITY` filters by `detection_layer` (`"all"` / `"keyword"` /
+  `"prompt_injection"` / `"embedding"`).
+- Signature goes in `X-VisorShield-Signature: sha256=<hmac>`, computed over
+  the raw JSON body with `WEBHOOK_SECRET`. `config.py` refuses to start in
+  production with `WEBHOOK_URL` set and `WEBHOOK_SECRET` unset.
+- Delivery is fire-and-forget (`httpx.AsyncClient`, 10s timeout) — a slow or
+  failing webhook endpoint must never add latency to or block the client
+  response. Failures are logged (`webhook_delivery_failed`) and swallowed.
 
 ---
 
@@ -268,6 +372,42 @@ Update this table when provider pricing changes. This is the single source of tr
 | `X-Org-ID` | Yes | Organization UUID |
 | `X-VisorShield-User` | Yes | Caller identity (SSO subject / email / employee ID) — see Identity Model below |
 | `Content-Type` | Yes | `application/json` |
+
+---
+
+## Browser Extension Surface
+
+`app/routers/extension.py` (`POST /v1/extension/*`) is a second entry point
+for staff who paste prompts directly into chatgpt.com rather than calling the
+API. VisorShield is **not** in the network path for that traffic — the
+extension's content script captures the composer text, sends it here, gets
+back a masked version, and types that into the page itself. Nothing is
+forwarded to a provider from this surface.
+
+It deliberately reuses pipeline steps 1–4 (`auth_middleware`,
+`rate_limit_middleware`, the Presidio scan, `guardrails_middleware`) exactly
+as the proxy does — same fail-closed rules, same 451/500/429 behavior. Step 5
+is a separate call, `POST /v1/extension/response-scan`, invoked by the
+extension only when the org's policy sets `audit_responses`, since only the
+page can see the model's answer.
+
+What's different from the proxy, and why:
+- The masked prompt **and** the placeholder→original map are returned to the
+  caller (`ScanEntity.original` in `app/models/extension.py`) instead of the
+  map being used server-side for rehydration. That map is the
+  re-identification key — never persisted, never logged — and the extension
+  keeps it in `chrome.storage.session` only.
+- No model call happens here, so there's no token usage or cost. Audit rows
+  from this surface record zero tokens and an empty provider: a scan is a
+  compliance event, not a spend event.
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /v1/extension/scan` | Steps 1–4 on a captured prompt → masked text + entity map, or 451 |
+| `POST /v1/extension/response-scan` | Step 5 on the assistant's answer; types + placeholders only |
+| `GET /v1/extension/policy` | Device policy, `fail_mode: closed` |
+| `POST /v1/extension/events` | Metadata-only telemetry |
+| `POST /v1/extension/heartbeat` | Device liveness → upserts `browser_installations` (see AI Inventory) |
 
 ---
 
@@ -420,6 +560,22 @@ DEFAULT_PROVIDER=openai
 FALLBACK_PROVIDER=anthropic
 ENVIRONMENT=development
 AUTH_FAIL_OPEN_ON_DB_ERROR=false  # never true in production — see Failure Modes
+
+# Guardrails (per-org pgvector layer — see Guardrails: Three-Layer Detection)
+EMBEDDING_MODEL=paraphrase-MiniLM-L6-v2
+PGVECTOR_DIMENSIONS=384
+EMBEDDING_CACHE_TTL_SECONDS=300
+IVFFLAT_PROBES=5
+EMBEDDING_SIMILARITY_THRESHOLD=0.72
+GUARDRAIL_PROMPT_INJECTION_ENABLED=true
+
+# PII rehydration (see PII Rehydration)
+PII_REHYDRATION_ENABLED=true
+
+# Webhook alerts (see Webhook Alerts) — optional; unset WEBHOOK_URL disables entirely
+WEBHOOK_URL=
+WEBHOOK_SECRET=            # required if WEBHOOK_URL is set — enforced in production
+WEBHOOK_MIN_SEVERITY=all   # all | keyword | prompt_injection | embedding
 ```
 
 ---
@@ -462,6 +618,11 @@ pytest tests/ -v --tb=short
 3. Write an alembic migration (new revision, `down_revision` = current head) — never edit an already-applied migration
 4. Thread it through `log_transaction(...)` call sites and `_tx_export_row` in `app/routers/audit.py`
 
+**Set custom guardrail topics for an org (Layer 3 pgvector):**
+1. `POST /admin/organizations/{org_id}/policy-embeddings` with `policy_profile` + `topics: [...]` — this embeds and upserts each topic into `policy_embeddings` and invalidates the presence cache immediately
+2. `GET .../policy-embeddings` to list what's stored; `DELETE .../policy-embeddings/{policy_profile}` to clear a profile back to the default topic set
+3. No migration needed — this is data, not schema
+
 ---
 
 ## What NOT To Do
@@ -478,3 +639,7 @@ pytest tests/ -v --tb=short
 - **Never UPDATE or DELETE rows in `transactions` or `guardrail_incidents`.** The append-only trigger (`prevent_audit_mutation()`) rejects it at the DB level; if you need to fix bad data, insert a correction row, don't edit history.
 - **Never add a field to `Transaction` without adding it to `canonical_transaction_fields(...)` in `audit_integrity.py`.** A column outside the hash is a column that can be silently edited without `/audit/verify` ever noticing.
 - **Never make `X-VisorShield-User` optional or best-effort at the header level.** Identity *resolution* (the DB upsert) is allowed to fail open — see Failure Modes — but the header itself is required, same as `X-Industry-Type`.
+- **Never rehydrate PII before the response scanner runs.** `rehydrate_pii()` must come *after* step 5 masks model-introduced PII — see PII Rehydration. Reversing the order can hand the scanner values it should have flagged.
+- **Never scan or rehydrate a streaming response chunk-by-chunk.** Buffer the full SSE response first, then run step 5 and rehydration once — see Guardrails/PII Rehydration.
+- **Never let webhook delivery block or fail the request.** `send_guardrail_alert()` is fire-and-forget with its own timeout; a slow or down webhook endpoint must never add latency to the client response.
+- **Never reorder the three guardrail layers** (keyword → prompt-injection → embedding) or add a fourth without updating this file — see Guardrails: Three-Layer Detection.
