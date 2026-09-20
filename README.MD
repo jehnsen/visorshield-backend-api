@@ -439,6 +439,9 @@ See `app/policies/govtech.py` as the reference implementation (includes custom P
 - Audit rows are tamper-evident: a per-org SHA-256 hash chain plus a database-level append-only trigger reject any `UPDATE`/`DELETE` on `transactions` or `guardrail_incidents`, regardless of which role issues the statement. `GET /audit/verify` detects the first broken link, if any.
 - The auth org/API-key active check fails **closed** by default (`AUTH_FAIL_OPEN_ON_DB_ERROR=false`) — if Postgres is unreachable, the request is blocked (`503`) rather than let a possibly-revoked key through. `config.py` refuses to start in production with this flipped.
 
+## Run
+uvicorn main:app --host 127.0.0.1 --port 8000 --reload
+
 ## License
 
 Proprietary. All rights reserved.
