@@ -21,8 +21,10 @@ async def scan_response(text: str, request: Request) -> str:
     """
     start = time.monotonic()
 
-    industry_type = request.headers.get("X-Industry-Type", "")
-    org_id = getattr(request.state, "jwt_claims", {}).get("org_id", "unknown")
+    claims = getattr(request.state, "jwt_claims", {})
+    # Policy comes from the verified JWT claim, never the raw header (see pii_engine).
+    industry_type = claims.get("industry_type") or request.headers.get("X-Industry-Type", "")
+    org_id = claims.get("org_id", "unknown")
     request_id = getattr(request.state, "request_id", "")
 
     masked_text, detected, scan_error = await _safe_pii_scan(text, industry_type)

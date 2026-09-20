@@ -35,6 +35,19 @@ def make_jwt(
     return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
 
 
+
+def monthly_quota_key(org_id="test-org-123", sub="user-abc"):
+    """
+    The Redis monthly-quota key rate_limit.py will read for a make_jwt() token.
+
+    Built with the app's own _api_key_hash so tests track the real key scheme
+    (derived from the JWT-signed ``sub``, never a client-supplied header).
+    """
+    import datetime
+    from app.middleware.rate_limit import _api_key_hash
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return f"visorshield:{org_id}:{_api_key_hash({'sub': sub})}:monthly_tokens:{now.year}:{now.month}"
+
 FAKE_OPENAI_RESPONSE = {
     "id": "chatcmpl-test",
     "object": "chat.completion",

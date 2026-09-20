@@ -1,4 +1,4 @@
-from app.models.policy import PolicyProfile
+from app.models.policy import PolicyProfile, CustomRecognizer, CustomPattern
 
 LEGAL_HR_POLICY = PolicyProfile(
     name="legal_hr",
@@ -34,7 +34,11 @@ LEGAL_HR_POLICY = PolicyProfile(
         "racial discrimination",
         "disability discrimination",
     ],
-    regex_patterns={
-        "BAR_NUMBER": r"\bBar\s*#?\s*\d{4,8}\b",
-    },
+    custom_recognizers=[
+        CustomRecognizer(
+            entity="BAR_NUMBER",
+            patterns=[CustomPattern(name="bar_number", regex=r"\bBar\s*#?\s*\d{4,8}\b", score=0.85)],
+            context=["attorney", "roll", "ibp"],
+        ),
+    ],
 )

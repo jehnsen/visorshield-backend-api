@@ -5,7 +5,7 @@ Each step must succeed for the request to complete; failures are tested with tar
 """
 import pytest
 from unittest.mock import patch, AsyncMock, MagicMock
-from tests.conftest import make_jwt, FAKE_OPENAI_RESPONSE
+from tests.conftest import make_jwt, FAKE_OPENAI_RESPONSE, monthly_quota_key
 
 pytestmark = pytest.mark.asyncio
 
@@ -59,7 +59,7 @@ async def test_pipeline_step2_blocks_on_quota(client, valid_token, fake_redis):
     """Step 2 (rate limit) blocks when monthly quota is exceeded."""
     import datetime
     now = datetime.datetime.now(datetime.timezone.utc)
-    key = f"visorshield:test-org-123:default:monthly_tokens:{now.year}:{now.month}"
+    key = monthly_quota_key()
     await fake_redis.set(key, 999_999_999)
 
     with patch("app.middleware.auth._validate_api_key_active", new_callable=AsyncMock):

@@ -1,4 +1,4 @@
-from app.models.policy import PolicyProfile
+from app.models.policy import PolicyProfile, CustomRecognizer, CustomPattern
 
 HEALTHCARE_POLICY = PolicyProfile(
     name="healthcare",
@@ -30,8 +30,17 @@ HEALTHCARE_POLICY = PolicyProfile(
         "replace your doctor",
         "self-diagnose",
     ],
-    regex_patterns={
-        "NPI": r"\b\d{10}\b",
-        "DEA_NUMBER": r"\b[A-Z]{2}\d{7}\b",
-    },
+    custom_recognizers=[
+        CustomRecognizer(
+            entity="NPI",
+            patterns=[CustomPattern(name="npi_10_digit", regex=r"\b\d{10}\b", score=0.4)],
+            context=["npi", "provider", "national provider"],
+        ),
+        CustomRecognizer(
+            entity="DEA_NUMBER",
+            patterns=[CustomPattern(name="dea", regex=r"\b[A-Z]{2}\d{7}\b", score=0.6)],
+            context=["dea", "registration"],
+            case_sensitive=True,
+        ),
+    ],
 )

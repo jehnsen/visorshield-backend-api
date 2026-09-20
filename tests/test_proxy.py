@@ -2,7 +2,7 @@ import pytest
 import time
 import jwt
 from unittest.mock import patch, AsyncMock
-from tests.conftest import make_jwt, FAKE_OPENAI_RESPONSE
+from tests.conftest import make_jwt, FAKE_OPENAI_RESPONSE, monthly_quota_key
 from app.config import settings
 
 pytestmark = pytest.mark.asyncio
@@ -83,7 +83,7 @@ async def test_quota_exceeded(client, valid_token, fake_redis):
     import datetime
     from calendar import monthrange
     now = datetime.datetime.now(datetime.timezone.utc)
-    monthly_key = f"visorshield:test-org-123:default:monthly_tokens:{now.year}:{now.month}"
+    monthly_key = monthly_quota_key()
     await fake_redis.set(monthly_key, 10_000_000)  # exceed 1M budget
 
     resp = await client.post(

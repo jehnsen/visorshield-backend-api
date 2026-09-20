@@ -189,18 +189,35 @@ Set via `X-Industry-Type` request header. Valid values:
 |---|---|---|
 | `healthcare` | HIPAA / DPA | PERSON, PHONE_NUMBER, EMAIL_ADDRESS, MEDICAL_LICENSE, US_SSN, DATE_TIME |
 | `fintech` | PCI-DSS / SEC | CREDIT_CARD, IBAN_CODE, SWIFT_BIC, PHONE_NUMBER, EMAIL_ADDRESS, US_BANK_NUMBER |
-| `govtech` | COA / DILG | PH_TIN, PH_SSS, PH_PHILSYS (custom), PERSON, PHONE_NUMBER, EMAIL_ADDRESS |
+| `govtech` | COA / DILG | PH_TIN, PH_SSS, PH_PHILSYS (custom), CREDIT_CARD, PERSON, PHONE_NUMBER, EMAIL_ADDRESS |
 | `legal_hr` | Bias / Sensitivity | PERSON, EMAIL_ADDRESS, PHONE_NUMBER, AGE, NRP |
 
 ### Philippine Custom Recognizers (govtech profile)
 
-These are custom Presidio recognizers — regex-based:
+Declared as `custom_recognizers` in `app/policies/govtech.py` and registered as
+real Presidio `PatternRecognizer`s — so matches get indexed placeholders, land in
+the rehydration map and `pii_detected`, and get context-word score boosts:
 
-- **PH_TIN** — format: `XXX-XXX-XXX-XXX` (12 digits, dashes)
-- **PH_SSS** — format: `XX-XXXXXXX-X`
-- **PH_PHILSYS** — 16 consecutive digits
+- **PH_TIN** — `XXX-XXX-XXX-XXX` (9 digits + 3-digit branch code), or `XXX-XXX-XXX` without the branch code
+- **PH_SSS** — `XX-XXXXXXX-X`
+- **PH_PHILSYS** — `XXXX-XXXX-XXXX-XXXX` or 16 bare digits. Bare 16 digits is also a card number's
+  shape, which is why `CREDIT_CARD` is in the govtech entity list: a Luhn-valid card outranks it.
+- **PERSON (particle surnames)** — `Juan dela Cruz`, `Ma. Cristina de los Santos`. Backs spaCy, which
+  splits or misses these. Case-sensitive; registered globally, so it applies to every profile scanning PERSON.
 
-These live in `app/policies/govtech.py`. If BIR or PSA changes formats, update the regex there only.
+These formats live in `app/policies/govtech.py` only. If BIR, SSS or PSA changes a format, update it there.
+
+Local-format PH phone numbers (`09171234567`, `(02) 8123-4567`) depend on `PII_PHONE_REGIONS`
+including `PH` — Presidio's default region list does not.
+
+**Every policy's regex entities go through Presidio this way** (`NPI`, `DEA_NUMBER`, `ROUTING_NUMBER`,
+`CVV`, `BAR_NUMBER` too). Never mask with a post-scan `re.sub`: it bypasses indexing, rehydration and audit.
+
+Overlapping detections are merged into one masked region (every flagged character stays masked) and
+labelled by the most specific recognizer — pattern/validated recognizers win over spaCy NER labels.
+
+Presidio analysis runs in a bounded worker thread (`scan_text_async`, `PII_SCAN_MAX_THREADS`) — never
+call `_scan_text` directly from async code; it blocks the event loop.
 
 ---
 
@@ -599,7 +616,7 @@ pytest tests/ -v --tb=short
 ## Common Tasks
 
 **Add a new industry policy profile:**
-1. Create `app/policies/<industry>.py` with recognizer list and blocklist
+1. Create `app/policies/<industry>.py` with `pii_entities`, blocklist, and any regex entities as `custom_recognizers`
 2. Add the new value to the `IndustryType` enum in `app/models/policy.py`
 3. Register it in `app/middleware/pii_engine.py` template loader
 4. Register it in `app/middleware/guardrails.py` policy loader

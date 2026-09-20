@@ -81,7 +81,7 @@ async def test_embedding_similarity_guardrail(client):
 
     with patch("app.middleware.pii_engine.get_analyzer") as mock_pii, \
          patch("app.middleware.guardrails.get_embedding_model", return_value=mock_model), \
-         patch("app.middleware.guardrails._prohibited_embeddings_cache", {}):
+         patch("app.middleware.guardrails._default_embeddings_cache", {}):
         mock_pii.return_value = MagicMock(analyze=MagicMock(return_value=[]))
         mock_model.encode.side_effect = lambda texts, **kw: np.ones((len(texts), 1))
 

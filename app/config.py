@@ -1,6 +1,6 @@
 from pydantic import model_validator
 from pydantic_settings import BaseSettings
-from typing import Literal, Optional
+from typing import List, Literal, Optional
 
 _INSECURE_JWT_DEFAULT = "change-me-in-production"
 
@@ -26,6 +26,13 @@ class Settings(BaseSettings):
     # Restore caller-supplied PII (masked out of the prompt) in the LLM response
     # so the client sees real names instead of [PERSON_1] tokens.
     PII_REHYDRATION_ENABLED: bool = True
+    # Presidio/spaCy analysis is synchronous CPU work; it runs in a worker thread
+    # so it never blocks the event loop. Bounds concurrent scans per process.
+    PII_SCAN_MAX_THREADS: int = 4
+    # Regions phonenumbers uses to validate numbers written without a country
+    # code. Presidio's defaults omit PH, so "09171234567" and "(02) 8123-4567"
+    # went undetected. PH first; the rest are Presidio's original defaults.
+    PII_PHONE_REGIONS: List[str] = ["PH", "US", "UK", "DE", "FE", "IL", "IN", "CA", "BR"]
     # Webhook alerts
     WEBHOOK_URL: Optional[str] = None
     WEBHOOK_SECRET: Optional[str] = None

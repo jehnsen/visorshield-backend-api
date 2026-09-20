@@ -25,11 +25,11 @@ router = APIRouter()
 
 def _require_valid_industry_type(request: Request) -> str:
     """
-    Enforce a recognized X-Industry-Type header before any pipeline step runs.
+    Enforce a recognized X-Industry-Type before PII scanning or guardrails run.
 
-    Fail-closed: an unknown or missing profile would cause PII masking to fall
-    back to a generic entity list and would skip the guardrail check entirely,
-    so the request is rejected outright — consistent with the PII fail-closed rule.
+    Fail-closed: an unknown profile would cause PII masking to fall back to a
+    generic entity list and would skip the guardrail check entirely, so the
+    request is rejected outright — consistent with the PII fail-closed rule.
     """
     industry_type = request.headers.get("X-Industry-Type", "").strip()
     if industry_type not in VALID_INDUSTRY_TYPES:
@@ -45,8 +45,17 @@ def _require_valid_industry_type(request: Request) -> str:
     return industry_type
 
 
+async def _validate_industry_type(request: Request) -> None:
+    _require_valid_industry_type(request)
+
+
+# Industry validation runs AFTER auth: an unauthenticated request gets 401 before
+# anything inspects its headers. Auth already rejects a missing header (422) or
+# one that differs from the token's claim (403); this step catches a token minted
+# with an unknown industry_type, still before PII scanning and guardrails.
 _PIPELINE_STEPS = [
     ("auth", auth_middleware),
+    ("industry_type_validation", _validate_industry_type),
     ("rate_limit", rate_limit_middleware),
     ("pii_engine", pii_scan_request),
     ("guardrails", guardrails_middleware),
@@ -70,16 +79,7 @@ async def _run_pipeline(request: Request, body: ChatCompletionRequest) -> None:
     single place.
     """
     request.state.parsed_body = body
-    try:
-        header_industry_type = _require_valid_industry_type(request)
-    except HTTPException:
-        record_blocked(
-            org_id="unknown",
-            industry_type=request.headers.get("X-Industry-Type", "").strip() or "unknown",
-            pipeline_step="industry_type_validation",
-            reason="invalid_industry_type",
-        )
-        raise
+    header_industry_type = request.headers.get("X-Industry-Type", "").strip() or "unknown"
 
     for step_name, step_fn in _PIPELINE_STEPS:
         try:

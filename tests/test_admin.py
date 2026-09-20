@@ -2,7 +2,7 @@
 import pytest
 import uuid
 from unittest.mock import patch, AsyncMock, MagicMock
-from tests.conftest import make_jwt
+from tests.conftest import make_jwt, monthly_quota_key
 
 pytestmark = pytest.mark.asyncio
 
@@ -16,43 +16,56 @@ def _admin_headers(token: str) -> dict:
 # ── Organization endpoints ─────────────────────────────────────────────────
 
 async def test_create_org_success(client, admin_token):
-    with patch("app.routers.admin.get_db") as mock_get_db, \
-         patch("app.middleware.auth._validate_api_key_active", new_callable=AsyncMock):
-        mock_session = AsyncMock()
-        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session.__aexit__ = AsyncMock(return_value=False)
-        mock_org = MagicMock()
-        mock_org.id = uuid.uuid4()
-        mock_org.name = "Test Hospital"
-        mock_org.industry_type = "healthcare"
-        mock_org.monthly_token_budget = 1_000_000
-        mock_org.requests_per_second_limit = 10
-        mock_org.allowed_models = ["gpt-4o-mini"]
-        mock_org.is_active = True
-        mock_org.created_at = None
-        mock_session.flush = AsyncMock()
-        mock_session.refresh = AsyncMock()
-        mock_session.commit = AsyncMock()
-        mock_session.rollback = AsyncMock()
-        mock_session.close = AsyncMock()
+    """
+    get_db is overridden via app.dependency_overrides — patching the module
+    attribute has no effect, because Depends(get_db) captured the original
+    function when the route was defined (and the test then hit real Postgres).
+    """
+    from app.main import app
+    from app.db.database import get_db
+    from app.models.audit import Organization
 
-        async def _mock_db():
-            yield mock_session
+    org_id = uuid.uuid4()
+    session = MagicMock()
+    session.flush = AsyncMock()
 
-        mock_get_db.return_value = _mock_db()
+    async def _refresh(org):
+        # Simulate the DB assigning server-side values on flush/refresh.
+        org.id = org_id
+        org.is_active = True
 
-        resp = await client.post(
-            "/admin/organizations",
-            json={
-                "name": "Test Hospital",
-                "industry_type": "healthcare",
-                "monthly_token_budget": 500_000,
-            },
-            headers=_admin_headers(admin_token),
-        )
+    session.refresh = AsyncMock(side_effect=_refresh)
 
-    # Will get 401 because admin token validation hits DB mock, but structure check is enough
-    assert resp.status_code in (201, 401, 422)
+    async def _override_get_db():
+        yield session
+
+    app.dependency_overrides[get_db] = _override_get_db
+    try:
+        with patch("app.middleware.auth._validate_api_key_active", new_callable=AsyncMock):
+            resp = await client.post(
+                "/admin/organizations",
+                json={
+                    "name": "Test Hospital",
+                    "industry_type": "healthcare",
+                    "monthly_token_budget": 500_000,
+                },
+                headers=_admin_headers(admin_token),
+            )
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["id"] == str(org_id)
+    assert body["name"] == "Test Hospital"
+    assert body["industry_type"] == "healthcare"
+    assert body["monthly_token_budget"] == 500_000
+    assert body["is_active"] is True
+
+    added = session.add.call_args.args[0]
+    assert isinstance(added, Organization)
+    assert added.name == "Test Hospital"
+    session.flush.assert_awaited_once()
 
 
 async def test_create_org_invalid_industry_type(client, admin_token):
@@ -83,7 +96,7 @@ async def test_quota_exceeded_response_format(client, valid_token, fake_redis):
     """Quota-exceeded 429 must include reset_date."""
     import datetime
     now = datetime.datetime.now(datetime.timezone.utc)
-    monthly_key = f"visorshield:test-org-123:default:monthly_tokens:{now.year}:{now.month}"
+    monthly_key = monthly_quota_key()
     await fake_redis.set(monthly_key, 100_000_000)
 
     with patch("app.middleware.auth._validate_api_key_active", new_callable=AsyncMock):

@@ -37,7 +37,7 @@ from sqlalchemy import and_, func, select
 
 from app.middleware.auth import auth_middleware
 from app.middleware.guardrails import guardrails_middleware
-from app.middleware.pii_engine import _scan_text, _apply_regex_patterns
+from app.middleware.pii_engine import scan_text_async, entities_for
 from app.middleware.rate_limit import rate_limit_middleware
 from app.models.audit import Transaction
 from app.models.extension import (
@@ -165,10 +165,9 @@ async def scan_prompt(request: Request, body: ExtensionScanRequest) -> Extension
     # that the engine must never fail open.
     scan_start = time.monotonic()
     try:
-        masked_prompt, detected_types, placeholder_map = _scan_text(
-            body.prompt, policy.pii_entities
+        masked_prompt, detected_types, placeholder_map = await scan_text_async(
+            body.prompt, entities_for(policy)
         )
-        masked_prompt = _apply_regex_patterns(masked_prompt, policy.regex_patterns)
     except Exception as exc:
         log.error(
             "pii_scan_failed",
@@ -320,7 +319,7 @@ async def scan_assistant_response(
     policy = get_policy(industry_type)
 
     try:
-        _, detected, placeholder_map = _scan_text(body.text, policy.pii_entities)
+        _, detected, placeholder_map = await scan_text_async(body.text, entities_for(policy))
     except Exception as exc:
         log.error(
             "response_pii_scan_failed",
